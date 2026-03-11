@@ -1,0 +1,64 @@
+# Dis-Alignment Configuration
+# Copy this file to config.yaml and customize as needed
+
+# Feature extraction settings
+features:
+  # Sample rate for audio loading
+  sr: 22050
+  
+  # Hop length between successive frames
+  hop_length: 512
+  
+  # Number of chroma bins (12 for Western music)
+  n_chroma: 12
+  
+  # CQT resolution (bins per octave)
+  bins_per_octave: 36
+  
+  # DLNCO decay rate (higher = slower decay)
+  decay_rate: 0.8
+
+# Alignment algorithm settings
+alignment:
+  # Distance metric: cosine, euclidean, manhattan
+  distance: cosine
+  
+  # Sakoe-Chiba band radius (null = no constraint)
+  sakoe_chiba_radius: null
+  
+  # Memory limit for MrMsDTW (megabytes)
+  mrmsdtw_memory_mb: 500
+  
+  # Number of resolution scales for MsDTW
+  mrmsdtw_scales: 3
+
+# Evaluation settings  
+evaluation:
+  # Tolerance for alignment rate calculation (seconds)
+  tolerance_50ms: 0.05
+  tolerance_100ms: 0.10
+  
+  # Number of parallel workers
+  num_workers: 1
+  
+  # Whether to cache extracted features
+  cache_features: true
+
+# Dataset paths
+data:
+  # MAESTRO dataset location
+  maestro_path: null  # Set in config.yaml
+  
+  # Cache directory for features
+  cache_dir: .cache/features
+
+# Output settings
+output:
+  # Results directory
+  results_dir: results
+  
+  # Figures directory
+  figures_dir: figures
+  
+  # Figure format: png, pdf, svg
+  figure_format: png

@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+.venv312/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# General Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Data and checkpoints
+data/
+checkpoints/
+*.pt
+
+# Python typing
+.mypy_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
