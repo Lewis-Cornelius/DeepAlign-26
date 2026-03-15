@@ -102,7 +102,9 @@ def extract_deep_features(
     )
     cqt_mag = np.abs(cqt)
     cqt_log = librosa.amplitude_to_db(cqt_mag, ref=np.max)
-    cqt_log = (cqt_log - cqt_log.min()) / (cqt_log.max() - cqt_log.min() + 1e-8)
+    
+    # Standardize to zero-mean, unit-variance (matches InstanceNorm in training)
+    cqt_log = (cqt_log - cqt_log.mean()) / (cqt_log.std() + 1e-8)
 
     # Convert to tensor: (1, 1, freq, time)
     spec = torch.from_numpy(cqt_log).float().unsqueeze(0).unsqueeze(0).to(device)
