@@ -1,64 +1,36 @@
-# Dis-Alignment Configuration
-# Copy this file to config.yaml and customize as needed
+# DeepAlign-26 baseline comparison defaults
+#
+# This file documents the default settings used for hand-crafted feature
+# baselines and downstream analysis. The main training config lives in
+# config/deepalign.yaml.
 
-# Feature extraction settings
+dataset:
+  swd_path: null
+  performances: null
+  lieder: null
+
 features:
-  # Sample rate for audio loading
   sr: 22050
-  
-  # Hop length between successive frames
-  hop_length: 512
-  
-  # Number of chroma bins (12 for Western music)
+  hop_length: 440
+  feature_type: chroma
   n_chroma: 12
-  
-  # CQT resolution (bins per octave)
   bins_per_octave: 36
-  
-  # DLNCO decay rate (higher = slower decay)
   decay_rate: 0.8
 
-# Alignment algorithm settings
 alignment:
-  # Distance metric: cosine, euclidean, manhattan
   distance: cosine
-  
-  # Sakoe-Chiba band radius (null = no constraint)
   sakoe_chiba_radius: null
-  
-  # Memory limit for MrMsDTW (megabytes)
   mrmsdtw_memory_mb: 500
-  
-  # Number of resolution scales for MsDTW
   mrmsdtw_scales: 3
 
-# Evaluation settings  
 evaluation:
-  # Tolerance for alignment rate calculation (seconds)
   tolerance_50ms: 0.05
   tolerance_100ms: 0.10
-  
-  # Number of parallel workers
-  num_workers: 1
-  
-  # Whether to cache extracted features
-  cache_features: true
+  tolerance_200ms: 0.20
+  baseline_method: chroma_dtw
+  candidate_method: deepalign
 
-# Dataset paths
-data:
-  # MAESTRO dataset location
-  maestro_path: null  # Set in config.yaml
-  
-  # Cache directory for features
-  cache_dir: .cache/features
-
-# Output settings
 output:
-  # Results directory
-  results_dir: results
-  
-  # Figures directory
+  results_csv: results/swd_evaluation.csv
   figures_dir: figures
-  
-  # Figure format: png, pdf, svg
   figure_format: png

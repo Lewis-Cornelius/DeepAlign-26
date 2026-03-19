@@ -48,11 +48,12 @@ def plot_error_vs_length(
     """
     fig, ax = plt.subplots(figsize=figsize)
     
-    algorithms = results["algorithm"].unique()
+    method_col = _method_column(results)
+    algorithms = results[method_col].unique()
     palette = sns.color_palette("husl", len(algorithms))
     
     for algo, color in zip(algorithms, palette):
-        data = results[results["algorithm"] == algo]
+        data = results[results[method_col] == algo]
         
         ax.scatter(
             data["duration_s"] / 60,  # Convert to minutes
@@ -64,10 +65,11 @@ def plot_error_vs_length(
         )
         
         # Add regression line
-        z = np.polyfit(data["duration_s"] / 60, data[metric], 1)
-        p = np.poly1d(z)
-        x_line = np.linspace(data["duration_s"].min() / 60, data["duration_s"].max() / 60, 100)
-        ax.plot(x_line, p(x_line), "--", color=color, alpha=0.8, linewidth=1.5)
+        if len(data) >= 2:
+            z = np.polyfit(data["duration_s"] / 60, data[metric], 1)
+            p = np.poly1d(z)
+            x_line = np.linspace(data["duration_s"].min() / 60, data["duration_s"].max() / 60, 100)
+            ax.plot(x_line, p(x_line), "--", color=color, alpha=0.8, linewidth=1.5)
     
     ax.set_xlabel("Piece Duration (minutes)")
     ax.set_ylabel(f"{metric.upper()} (seconds)")
@@ -106,11 +108,12 @@ def plot_runtime_comparison(
     """
     fig, ax = plt.subplots(figsize=figsize)
     
-    algorithms = results["algorithm"].unique()
+    method_col = _method_column(results)
+    algorithms = results[method_col].unique()
     palette = sns.color_palette("husl", len(algorithms))
     
     for algo, color in zip(algorithms, palette):
-        data = results[results["algorithm"] == algo].sort_values("duration_s")
+        data = results[results[method_col] == algo].sort_values("duration_s")
         
         ax.scatter(
             data["duration_s"],
@@ -296,11 +299,12 @@ def plot_metric_boxplot(
     Returns:
         Matplotlib Figure object.
     """
+    method_col = _method_column(results)
     fig, ax = plt.subplots(figsize=figsize)
     
     sns.boxplot(
         data=results,
-        x="algorithm",
+        x=method_col,
         y=metric,
         palette="husl",
         ax=ax,
@@ -333,7 +337,8 @@ def create_summary_table(
     Returns:
         Summary DataFrame.
     """
-    summary = results.groupby("algorithm").agg({
+    method_col = _method_column(results)
+    summary = results.groupby(method_col).agg({
         "mae": ["mean", "std", "median"],
         "ar_50ms": ["mean", "std"],
         "ar_100ms": ["mean", "std"],
@@ -352,3 +357,11 @@ def create_summary_table(
             summary.to_csv(path)
     
     return summary
+
+
+def _method_column(results: pd.DataFrame) -> str:
+    if "algorithm" in results.columns:
+        return "algorithm"
+    if "method" in results.columns:
+        return "method"
+    raise KeyError("Expected an 'algorithm' or 'method' column")

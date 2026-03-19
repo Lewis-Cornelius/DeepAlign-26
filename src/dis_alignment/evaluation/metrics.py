@@ -1,4 +1,4 @@
-"""Evaluation metrics for audio-to-score alignment.
+"""Evaluation metrics for alignment experiments.
 
 Implements standard MIR evaluation metrics for alignment quality
 assessment, compatible with mir_eval conventions.

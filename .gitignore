@@ -18,7 +18,7 @@ build/
 .pytest_cache/
 
 # Data and checkpoints
-data/
+/data/
 checkpoints/
 *.pt
 

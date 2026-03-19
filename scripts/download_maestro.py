@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Download and prepare the MAESTRO dataset."""
+"""Download and prepare the MAESTRO dataset for legacy baseline experiments."""
 
 import os
 import sys

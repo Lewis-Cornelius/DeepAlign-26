@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "dis-alignment"
 version = "0.1.0"
-description = "Comparative Analysis of Multiscale Optimization Strategies for Audio-to-Score Alignment"
+description = "DeepAlign-26 dissertation toolkit for differentiable audio alignment on SWD"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 authors = [{ name = "Lewis" }]
-keywords = ["audio", "music", "alignment", "dtw", "mir"]
+keywords = ["audio", "music", "alignment", "soft-dtw", "deep-learning", "mir"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -35,9 +35,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# synctoolbox requires Python <3.13 and pandas <2.0
+# synctoolbox baseline support is best maintained in a pandas<2 environment
 synctoolbox = [
     "synctoolbox>=1.3.0",
+    "pandas<2.0",
 ]
 
 dl = [
@@ -54,6 +55,7 @@ dev = [
 
 [project.scripts]
 dis-benchmark = "dis_alignment.cli:main"
+deepalign = "dis_alignment.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dis_alignment"]

@@ -1,4 +1,4 @@
-"""CQT-based Chroma feature extraction for audio-to-score alignment."""
+"""CQT-based chroma features for DeepAlign baselines and inspection."""
 
 from typing import Literal
 

@@ -1,4 +1,4 @@
-"""Statistical analysis and failure diagnostics for benchmark results."""
+"""Statistical analysis and failure diagnostics for experiment results."""
 
 from typing import Any
 
@@ -9,7 +9,7 @@ from scipy import stats
 
 def summarize_results(
     results: pd.DataFrame,
-    group_by: str = "algorithm",
+    group_by: str | None = None,
 ) -> pd.DataFrame:
     """
     Generate summary statistics for benchmark results.
@@ -21,9 +21,10 @@ def summarize_results(
     Returns:
         Summary DataFrame with mean, std, min, max for key metrics.
     """
-    metrics = ["mae", "median_ae", "ar_50ms", "ar_100ms", "runtime_s", "memory_mb"]
-    
-    summary = results.groupby(group_by)[metrics].agg(
+    method_col = group_by or _method_column(results)
+    metrics = [column for column in ["mae", "median_ae", "ar_50ms", "ar_100ms", "runtime_s", "memory_mb"] if column in results.columns]
+
+    summary = results.groupby(method_col)[metrics].agg(
         ["mean", "std", "min", "max", "count"]
     )
     
@@ -64,7 +65,7 @@ def failure_analysis(
         "total_cases": len(results),
         "failure_count": len(failures),
         "failure_rate": len(failures) / len(results) if len(results) > 0 else 0,
-        "failures_by_algorithm": failures.groupby("algorithm").size().to_dict(),
+        "failures_by_algorithm": failures.groupby(_method_column(results)).size().to_dict(),
         "mean_duration_failures": failures["duration_s"].mean() if len(failures) > 0 else 0,
         "mean_duration_successes": successes["duration_s"].mean() if len(successes) > 0 else 0,
     }
@@ -79,8 +80,10 @@ def failure_analysis(
         analysis["longer_pieces_fail_more"] = failures["duration_s"].mean() > successes["duration_s"].mean()
     
     # Top failure pieces
+    id_col = _id_column(results)
+    method_col = _method_column(results)
     analysis["worst_pieces"] = failures.nlargest(10, "mae")[
-        ["piece_id", "algorithm", "mae", "ar_50ms", "duration_s"]
+        [id_col, method_col, "mae", "ar_50ms", "duration_s"]
     ].to_dict("records")
     
     return analysis
@@ -110,8 +113,11 @@ def compute_significance(
         Dict with test statistics and interpretation.
     """
     # Get paired observations
-    baseline_results = results[results["algorithm"] == baseline].set_index("piece_id")
-    candidate_results = results[results["algorithm"] == candidate].set_index("piece_id")
+    method_col = _method_column(results)
+    id_col = _id_column(results)
+
+    baseline_results = results[results[method_col] == baseline].set_index(id_col)
+    candidate_results = results[results[method_col] == candidate].set_index(id_col)
     
     # Find common pieces
     common_pieces = baseline_results.index.intersection(candidate_results.index)
@@ -185,8 +191,10 @@ def runtime_efficiency_analysis(
     """
     analysis = {}
     
-    for algo in results["algorithm"].unique():
-        data = results[results["algorithm"] == algo]
+    method_col = _method_column(results)
+
+    for algo in results[method_col].unique():
+        data = results[results[method_col] == algo]
         
         if len(data) < 5:
             continue
@@ -237,8 +245,10 @@ def memory_analysis(results: pd.DataFrame) -> dict[str, Any]:
     """
     analysis = {}
     
-    for algo in results["algorithm"].unique():
-        data = results[results["algorithm"] == algo]
+    method_col = _method_column(results)
+
+    for algo in results[method_col].unique():
+        data = results[results[method_col] == algo]
         
         analysis[algo] = {
             "mean_memory_mb": float(data["memory_mb"].mean()),
@@ -249,9 +259,26 @@ def memory_analysis(results: pd.DataFrame) -> dict[str, Any]:
         }
         
         # Memory scaling with duration
-        if len(data) >= 5:
-            corr, p = stats.pearsonr(data["duration_s"], data["memory_mb"])
+        valid = data[["duration_s", "memory_mb"]].dropna()
+        if len(valid) >= 5:
+            corr, p = stats.pearsonr(valid["duration_s"], valid["memory_mb"])
             analysis[algo]["memory_duration_correlation"] = float(corr)
             analysis[algo]["memory_scales_with_duration"] = corr > 0.5 and p < 0.05
     
     return analysis
+
+
+def _method_column(results: pd.DataFrame) -> str:
+    if "algorithm" in results.columns:
+        return "algorithm"
+    if "method" in results.columns:
+        return "method"
+    raise KeyError("Expected an 'algorithm' or 'method' column")
+
+
+def _id_column(results: pd.DataFrame) -> str:
+    if "piece_id" in results.columns:
+        return "piece_id"
+    if "pair_id" in results.columns:
+        return "pair_id"
+    raise KeyError("Expected a 'piece_id' or 'pair_id' column")

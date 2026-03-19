@@ -1,9 +1,4 @@
-"""Inference module for extracting learned features from a trained DeepAlign model.
-
-After training, the encoder can extract features from audio that are
-optimised for alignment. These features can then be used with
-classical DTW for the final alignment step.
-"""
+"""Inference helpers for extracting and aligning DeepAlign-26 features."""
 
 import logging
 from pathlib import Path
@@ -43,7 +38,10 @@ def load_trained_encoder(
     encoder = CRNNEncoder(
         n_freq_bins=config.get("n_freq_bins", 84),
         embed_dim=config.get("embed_dim", 64),
+        num_conv_channels=config.get("num_conv_channels"),
         gru_hidden_size=config.get("gru_hidden_size", 128),
+        num_gru_layers=config.get("num_gru_layers", 2),
+        dropout=config.get("dropout", 0.1),
     )
 
     # Load weights

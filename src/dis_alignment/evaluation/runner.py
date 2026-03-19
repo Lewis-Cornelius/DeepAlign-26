@@ -1,4 +1,4 @@
-"""Benchmark runner for systematic alignment evaluation."""
+"""Legacy MAESTRO benchmark runner kept for baseline-oriented experiments."""
 
 import json
 import logging
@@ -72,7 +72,7 @@ class PieceResult:
 
 class BenchmarkRunner:
     """
-    Orchestrates benchmark experiments on datasets.
+    Orchestrates legacy benchmark experiments on MAESTRO-style datasets.
     
     Handles feature extraction, algorithm execution, metric computation,
     and result aggregation with progress tracking and checkpointing.
@@ -80,7 +80,7 @@ class BenchmarkRunner:
     Example:
         >>> runner = BenchmarkRunner(config)
         >>> results = runner.run_on_dataset(dataset, split="test")
-        >>> runner.save_results("benchmark_results.csv")
+        >>> runner.save_results("legacy_maestro_results.csv")
     """
     
     def __init__(self, config: BenchmarkConfig):

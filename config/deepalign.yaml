@@ -1,13 +1,13 @@
-# DeepAlign-26 Training Configuration
+# DeepAlign-26 training configuration
 
-# Dataset
+# Dataset and sampling
 dataset:
-  swd_path: null  # Set to path of extracted SWD directory
+  swd_path: null  # Set to the extracted SWD root
   max_length_sec: 30.0
   val_split: 0.2
   performances: null  # null = use all available
 
-# Audio processing
+# Audio front-end
 audio:
   sr: 22050
   hop_length: 220  # ~10ms at 22050 Hz (as per initial plan)
@@ -22,7 +22,7 @@ model:
   num_gru_layers: 2
   dropout: 0.1
 
-# Training
+# Optimisation
 training:
   epochs: 50
   batch_size: 4
@@ -30,14 +30,14 @@ training:
   weight_decay: 0.0001
   gradient_clip: 1.0
 
-# Soft-DTW loss
+# Soft-DTW objective
 soft_dtw:
   start_gamma: 1.0
   end_gamma: 0.01
   normalize: true
   dist_func: sqeuclidean
 
-# Augmentation
+# Waveform augmentation
 augmentation:
   enabled: true
   time_stretch_range: [0.8, 1.2]
@@ -45,7 +45,7 @@ augmentation:
   noise_snr_range: [20.0, 40.0]
   augment_prob: 0.5
 
-# Output
+# Output artefacts
 output:
   checkpoint_dir: checkpoints
   save_every_n_epochs: 10

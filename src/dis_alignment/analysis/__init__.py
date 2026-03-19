@@ -1,4 +1,4 @@
-"""Analysis and visualization tools for benchmark results."""
+"""Analysis and visualization tools for DeepAlign experiment results."""
 
 from dis_alignment.analysis.visualize import (
     plot_error_vs_length,
