@@ -1,4 +1,4 @@
-"""SWD evaluation utilities for DeepAlign-26 and its baselines."""
+"""MazurkaBL evaluation helpers for DeepAlign robustness checks."""
 
 from __future__ import annotations
 
@@ -10,34 +10,29 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from dis_alignment.data.swd import (
-    SWDDataset,
-    SWDPair,
-    compute_ground_truth_measure_alignment,
-    load_swd_audio,
+from dis_alignment.data.mazurka import (
+    MazurkaDataset,
+    MazurkaPair,
+    compute_ground_truth_alignment,
+    load_mazurka_audio,
+    load_mazurka_annotations,
 )
 from dis_alignment.evaluation.common import (
     build_matchmaker_row,
-    check_success_criteria,
     evaluate_pairwise_methods,
-    extract_musicxml_measure_positions,
+    extract_score_event_positions_from_annotations,
     map_score_positions_to_events,
     parse_methods,
     run_matchmaker_for_piece,
-    save_evaluation_results,
-    summarize_evaluation,
-    temporal_pool,
-    fast_dtw_align,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 
 def evaluate_pair(
-    pair: SWDPair,
+    pair: MazurkaPair,
     *,
-    dataset: SWDDataset | None = None,
-    methods: list[str] | None = None,
+    methods: list[str],
     encoder: Any | None = None,
     sr: int = 22050,
     chroma_hop: int = 440,
@@ -61,26 +56,24 @@ def evaluate_pair(
     matchmaker_feature_type: str = "chroma",
     matchmaker_frame_rate: int = 100,
 ) -> list[dict[str, Any]]:
-    """Evaluate one SWD pair across the requested methods."""
-    resolved_methods = methods or ["chroma_dtw"]
-    ground_truth = compute_ground_truth_measure_alignment(pair)
+    """Evaluate one Mazurka pair across the requested methods."""
+    ground_truth = compute_ground_truth_alignment(pair)
     if ground_truth is None:
         return []
 
     annotations_a, annotations_b = ground_truth
     gt_a = annotations_a["time_s"].to_numpy(dtype=float)
     gt_b = annotations_b["time_s"].to_numpy(dtype=float)
-    audio_a, _ = load_swd_audio(pair.piece_a, sr=sr)
-    audio_b, _ = load_swd_audio(pair.piece_b, sr=sr)
-    score_path = dataset.get_score_path(pair.lied_id) if dataset is not None else None
+    audio_a, _ = load_mazurka_audio(pair.piece_a, sr=sr)
+    audio_b, _ = load_mazurka_audio(pair.piece_b, sr=sr)
 
     results = evaluate_pairwise_methods(
-        methods=[method for method in resolved_methods if method != "matchmaker"],
+        methods=[method for method in methods if method != "matchmaker"],
         pair_id=pair.pair_id,
-        group_id=pair.lied_id,
-        dataset_name="swd",
-        piece_a_id=pair.piece_a.piece_id,
-        piece_b_id=pair.piece_b.piece_id,
+        group_id=pair.work_id,
+        dataset_name="mazurka",
+        piece_a_id=pair.piece_a.performance_id,
+        piece_b_id=pair.piece_b.performance_id,
         audio_a=audio_a,
         audio_b=audio_b,
         gt_a=gt_a,
@@ -105,40 +98,41 @@ def evaluate_pair(
         fusion_chroma_weight=fusion_chroma_weight,
         refine_window_sec=refine_window_sec,
         score_refine_radius_sec=score_refine_radius_sec,
-        score_path=score_path,
+        score_path=pair.piece_a.score_path,
         event_ids=annotations_a["event_id"].astype(str).tolist(),
     )
 
-    if "matchmaker" not in resolved_methods:
+    if "matchmaker" not in methods:
         return results
 
-    if dataset is None:
-        raise ValueError("SWD Matchmaker evaluation requires the owning SWDDataset instance.")
+    if pair.piece_a.score_path is None or pair.piece_b.score_path is None:
+        raise FileNotFoundError(
+            f"Mazurka Matchmaker evaluation requires score files for {pair.piece_a.performance_id} "
+            f"and {pair.piece_b.performance_id}."
+        )
 
     if matchmaker_cache is None:
         matchmaker_cache = {}
 
     try:
         predicted_a, result_a = _get_matchmaker_predictions(
-            dataset=dataset,
             piece=pair.piece_a,
-            lied_id=pair.lied_id,
             method=matchmaker_method,
             feature_type=matchmaker_feature_type,
             frame_rate=matchmaker_frame_rate,
             cache=matchmaker_cache,
+            fallback_annotations=annotations_a,
         )
         predicted_b, result_b = _get_matchmaker_predictions(
-            dataset=dataset,
             piece=pair.piece_b,
-            lied_id=pair.lied_id,
             method=matchmaker_method,
             feature_type=matchmaker_feature_type,
             frame_rate=matchmaker_frame_rate,
             cache=matchmaker_cache,
+            fallback_annotations=annotations_b,
         )
     except Exception as exc:
-        LOGGER.warning("Skipping Matchmaker for SWD pair %s: %s", pair.pair_id, exc)
+        LOGGER.warning("Skipping Matchmaker for Mazurka pair %s: %s", pair.pair_id, exc)
         return results
 
     audio_a_ids = annotations_a["event_id"].astype(str).tolist()
@@ -162,11 +156,11 @@ def evaluate_pair(
 
     results.append(
         build_matchmaker_row(
-            dataset_name="swd",
+            dataset_name="mazurka",
             pair_id=pair.pair_id,
-            group_id=pair.lied_id,
-            piece_a_id=pair.piece_a.piece_id,
-            piece_b_id=pair.piece_b.piece_id,
+            group_id=pair.work_id,
+            piece_a_id=pair.piece_a.performance_id,
+            piece_b_id=pair.piece_b.performance_id,
             gt_a=gt_a_common,
             gt_b=gt_b_common,
             pred_a_anchor=pred_anchor_a,
@@ -178,14 +172,13 @@ def evaluate_pair(
     return results
 
 
-def evaluate_swd_dataset(
-    dataset: SWDDataset,
+def evaluate_mazurka_dataset(
+    dataset: MazurkaDataset,
     *,
     checkpoint_path: str | Path | None = None,
     device: str | None = None,
     methods: str | list[str] | tuple[str, ...] | None = None,
-    performances: list[str] | None = None,
-    lieder: list[str] | None = None,
+    works: list[str] | None = None,
     show_progress: bool = True,
     matchmaker_method: str = "arzt",
     matchmaker_feature_type: str = "chroma",
@@ -207,7 +200,7 @@ def evaluate_swd_dataset(
     refine_window_sec: float = 8.0,
     score_refine_radius_sec: float = 0.5,
 ) -> pd.DataFrame:
-    """Evaluate SWD pairs with the requested methods."""
+    """Evaluate Mazurka pairs with the requested methods."""
     resolved_methods = parse_methods(methods, checkpoint_path=checkpoint_path)
     encoder = None
     if "deepalign" in resolved_methods:
@@ -215,8 +208,8 @@ def evaluate_swd_dataset(
 
         encoder, _ = load_trained_encoder(checkpoint_path, device=device)
 
-    pair_iter = list(dataset.iter_pairs(performances=performances, lieder=lieder))
-    iterator = tqdm(pair_iter, desc="Evaluating SWD", disable=not show_progress)
+    pair_iter = list(dataset.iter_pairs(works=works))
+    iterator = tqdm(pair_iter, desc="Evaluating Mazurka", disable=not show_progress)
     rows: list[dict[str, Any]] = []
     matchmaker_cache: dict[tuple[str, str, str], tuple[pd.DataFrame, Any]] = {}
 
@@ -225,7 +218,6 @@ def evaluate_swd_dataset(
             rows.extend(
                 evaluate_pair(
                     pair,
-                    dataset=dataset,
                     methods=resolved_methods,
                     encoder=encoder,
                     sr=sr,
@@ -252,37 +244,32 @@ def evaluate_swd_dataset(
                 )
             )
         except Exception as exc:
-            LOGGER.warning("Skipping SWD pair %s due to evaluation error: %s", pair.pair_id, exc)
+            LOGGER.warning("Skipping Mazurka pair %s due to evaluation error: %s", pair.pair_id, exc)
 
     return pd.DataFrame(rows)
 
 
 def _get_matchmaker_predictions(
     *,
-    dataset: SWDDataset,
     piece,
-    lied_id: str,
     method: str,
     feature_type: str,
     frame_rate: int,
     cache: dict[tuple[str, str, str], tuple[pd.DataFrame, Any]],
+    fallback_annotations: pd.DataFrame,
 ) -> tuple[pd.DataFrame, Any]:
-    cache_key = (piece.piece_id, method, feature_type)
+    cache_key = (piece.performance_id, method, feature_type)
     if cache_key in cache:
         return cache[cache_key]
 
-    score_path = dataset.get_score_path(lied_id)
-    if score_path is None:
-        raise FileNotFoundError(f"Could not resolve a score for SWD lied {lied_id}.")
-
     result = run_matchmaker_for_piece(
-        score_path,
+        piece.score_path,
         piece.audio_path,
         method=method,
         feature_type=feature_type,
         frame_rate=frame_rate,
     )
-    measure_positions = extract_musicxml_measure_positions(score_path)
-    predicted = map_score_positions_to_events(result, measure_positions)
+    event_positions = extract_score_event_positions_from_annotations(fallback_annotations)
+    predicted = map_score_positions_to_events(result, event_positions)
     cache[cache_key] = (predicted, result)
     return predicted, result

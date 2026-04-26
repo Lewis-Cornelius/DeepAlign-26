@@ -323,6 +323,72 @@ def plot_metric_boxplot(
     return fig
 
 
+def plot_error_histogram(
+    results: pd.DataFrame,
+    metric: str = "mae",
+    output_path: str | Path | None = None,
+    figsize: tuple[float, float] = (8, 5),
+) -> plt.Figure:
+    """Plot per-method error distributions."""
+    method_col = _method_column(results)
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sns.histplot(
+        data=results,
+        x=metric,
+        hue=method_col,
+        stat="density",
+        element="step",
+        common_norm=False,
+        fill=False,
+        ax=ax,
+    )
+    ax.set_xlabel(f"{metric.upper()} (seconds)")
+    ax.set_ylabel("Density")
+    ax.set_title(f"{metric.upper()} Error Distribution")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if output_path:
+        fig.savefig(output_path)
+    return fig
+
+
+def plot_success_criteria_summary(
+    results: pd.DataFrame,
+    output_path: str | Path | None = None,
+    figsize: tuple[float, float] = (8, 5),
+) -> plt.Figure:
+    """Visualize the dissertation success criteria by method."""
+    method_col = _method_column(results)
+    summary = results.groupby(method_col).agg(
+        mae_ms=("mae", lambda series: float(series.mean() * 1000)),
+        ar_50ms_pct=("ar_50ms", lambda series: float(series.mean() * 100)),
+    )
+    summary = summary.reset_index()
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=False)
+    sns.barplot(data=summary, x=method_col, y="mae_ms", palette="husl", ax=axes[0])
+    axes[0].axhline(50.0, linestyle="--", color="black", linewidth=1, label="50 ms")
+    axes[0].axhline(20.0, linestyle=":", color="black", linewidth=1, label="20 ms")
+    axes[0].set_title("Mean MAE")
+    axes[0].set_ylabel("Milliseconds")
+    axes[0].tick_params(axis="x", rotation=45)
+    axes[0].legend(loc="upper right")
+
+    sns.barplot(data=summary, x=method_col, y="ar_50ms_pct", palette="husl", ax=axes[1])
+    axes[1].axhline(98.0, linestyle="--", color="black", linewidth=1, label="98%")
+    axes[1].set_title("AR@50ms")
+    axes[1].set_ylabel("Percent")
+    axes[1].tick_params(axis="x", rotation=45)
+    axes[1].legend(loc="upper right")
+
+    plt.tight_layout()
+    if output_path:
+        fig.savefig(output_path)
+    return fig
+
+
 def create_summary_table(
     results: pd.DataFrame,
     output_path: str | Path | None = None,
@@ -356,6 +422,30 @@ def create_summary_table(
         else:
             summary.to_csv(path)
     
+    return summary
+
+
+def create_success_criteria_table(
+    results: pd.DataFrame,
+    output_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """Create a compact success-criteria summary table."""
+    method_col = _method_column(results)
+    summary = results.groupby(method_col).agg(
+        mae_ms=("mae", lambda series: float(series.mean() * 1000)),
+        ar_50ms_pct=("ar_50ms", lambda series: float(series.mean() * 100)),
+    )
+    summary["passes_mae_50ms"] = summary["mae_ms"] < 50.0
+    summary["passes_mae_20ms"] = summary["mae_ms"] < 20.0
+    summary["passes_ar_98pct"] = summary["ar_50ms_pct"] > 98.0
+    summary = summary.reset_index()
+
+    if output_path:
+        path = Path(output_path)
+        if path.suffix == ".tex":
+            summary.to_latex(path, index=False, caption="Success Criteria Summary")
+        else:
+            summary.to_csv(path, index=False)
     return summary
 
 

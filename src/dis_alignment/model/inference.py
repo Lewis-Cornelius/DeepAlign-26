@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import librosa
 import numpy as np
@@ -10,6 +11,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 
 from dis_alignment.alignment.baseline_dtw import AlignmentResult, align_global_dtw
+from dis_alignment.model.cqt_cache import SpectrogramCache, compute_log_cqt, standardize_log_cqt
 from dis_alignment.model.encoder import CRNNEncoder
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ def load_trained_encoder(
         gru_hidden_size=config.get("gru_hidden_size", 128),
         num_gru_layers=config.get("num_gru_layers", 2),
         dropout=config.get("dropout", 0.1),
+        temporal_attention_heads=config.get("temporal_attention_heads", 0),
     )
 
     # Load weights
@@ -64,25 +67,29 @@ def load_trained_encoder(
 
 
 def extract_deep_features(
-    audio: NDArray[np.floating],
+    audio: NDArray[np.floating] | None,
     encoder: CRNNEncoder,
     sr: int = 22050,
     hop_length: int = 220,
     n_bins: int = 84,
     bins_per_octave: int = 12,
     device: str | None = None,
+    audio_path: str | Path | None = None,
+    cache_root: str | Path | None = None,
 ) -> NDArray[np.floating]:
     """
     Extract learned features from audio using a trained encoder.
 
     Args:
-        audio: Audio time series (mono).
+        audio: Audio time series (mono), optional when audio_path + cache_root are used.
         encoder: Trained CRNNEncoder.
         sr: Sample rate.
         hop_length: CQT hop length (~10ms at 22050 Hz).
         n_bins: Number of CQT bins.
         bins_per_octave: CQT resolution.
         device: Compute device.
+        audio_path: Optional source file path for cached CQT lookup.
+        cache_root: Optional cache directory for full-song log CQTs.
 
     Returns:
         Learned feature embeddings of shape (embed_dim, n_frames).
@@ -90,19 +97,39 @@ def extract_deep_features(
     if device is None:
         device = next(encoder.parameters()).device
 
-    # Compute CQT spectrogram
-    cqt = librosa.cqt(
-        y=audio.astype(np.float32),
-        sr=sr,
-        hop_length=hop_length,
-        n_bins=n_bins,
-        bins_per_octave=bins_per_octave,
-    )
-    cqt_mag = np.abs(cqt)
-    cqt_log = librosa.amplitude_to_db(cqt_mag, ref=np.max)
-    
-    # Standardize to zero-mean, unit-variance (matches InstanceNorm in training)
-    cqt_log = (cqt_log - cqt_log.mean()) / (cqt_log.std() + 1e-8)
+    if cache_root is not None and audio_path is not None:
+        cache = SpectrogramCache(
+            cache_root,
+            sr=sr,
+            hop_length=hop_length,
+            n_bins=n_bins,
+            bins_per_octave=bins_per_octave,
+        )
+        cqt_log = cache.load_or_compute(audio_path)
+    else:
+        if audio is None:
+            raise ValueError("Provide audio when cache_root/audio_path are not supplied.")
+        cqt_log = compute_log_cqt(
+            audio,
+            sr=sr,
+            hop_length=hop_length,
+            n_bins=n_bins,
+            bins_per_octave=bins_per_octave,
+        )
+    cqt_log = standardize_log_cqt(cqt_log)
+
+    return extract_deep_features_from_cqt(cqt_log, encoder, device=device)
+
+
+def extract_deep_features_from_cqt(
+    cqt_log: NDArray[np.floating],
+    encoder: CRNNEncoder,
+    *,
+    device: str | torch.device | None = None,
+) -> NDArray[np.floating]:
+    """Extract DeepAlign embeddings from an already prepared standardized log CQT."""
+    if device is None:
+        device = next(encoder.parameters()).device
 
     # Convert to tensor: (1, 1, freq, time)
     spec = torch.from_numpy(cqt_log).float().unsqueeze(0).unsqueeze(0).to(device)

@@ -20,6 +20,10 @@ build/
 # Data and checkpoints
 /data/
 checkpoints/
+/.cache/
+figures/
+logs/
+results/
 *.pt
 
 # Python typing

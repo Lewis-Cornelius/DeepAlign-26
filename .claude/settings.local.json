@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m dis_alignment.cli prepare-swd data/)",
+      "Bash(python -m dis_alignment.cli --help)"
+    ]
+  }
+}

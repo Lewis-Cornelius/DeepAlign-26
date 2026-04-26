@@ -4,6 +4,11 @@
 dataset:
   swd_path: null  # Set to the extracted SWD root
   max_length_sec: 30.0
+  segment_sampling: aligned_measures
+  samples_per_epoch: null  # null = max(256, len(train_pairs) * 16)
+  cache_spectrograms: false
+  cache_root: .cache/cqt
+  debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
   val_split: 0.2
   performances: null  # null = use all available
 
@@ -21,6 +26,7 @@ model:
   gru_hidden_size: 128
   num_gru_layers: 2
   dropout: 0.1
+  temporal_attention_heads: 0
 
 # Optimisation
 training:
@@ -29,6 +35,11 @@ training:
   lr: 0.001
   weight_decay: 0.0001
   gradient_clip: 1.0
+  resume_from: null
+  selection_metric: debug_ar50
+  anchor_loss_weight: 0.0
+  anchor_temperature: 0.1
+  anchor_min_anchor_gap: 1
 
 # Soft-DTW objective
 soft_dtw:
@@ -45,7 +56,20 @@ augmentation:
   noise_snr_range: [20.0, 40.0]
   augment_prob: 0.5
 
+# DeepAlign evaluation and debug-gate decoding
+evaluation:
+  deep_decode: unconstrained
+  band_radius_frames: null
+  transcription_cache_root: .cache/transcription/basic_pitch
+  fusion_deep_weight: 1.0
+  fusion_onset_weight: 1.0
+  fusion_note_weight: 0.75
+  fusion_dlnco_weight: 0.5
+  fusion_chroma_weight: 0.25
+  refine_window_sec: 8.0
+  score_refine_radius_sec: 0.5
+
 # Output artefacts
 output:
   checkpoint_dir: checkpoints
-  save_every_n_epochs: 10
+  save_every_n_epochs: 1

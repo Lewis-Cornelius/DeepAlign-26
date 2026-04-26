@@ -77,6 +77,7 @@ class CRNNEncoder(nn.Module):
         gru_hidden_size: int = 128,
         num_gru_layers: int = 2,
         dropout: float = 0.1,
+        temporal_attention_heads: int = 0,
     ):
         super().__init__()
 
@@ -85,6 +86,7 @@ class CRNNEncoder(nn.Module):
 
         self.n_freq_bins = n_freq_bins
         self.embed_dim = embed_dim
+        self.temporal_attention_heads = temporal_attention_heads
 
         # Build convolutional feature extractor
         # Pool only along frequency axis to preserve time resolution
@@ -118,11 +120,24 @@ class CRNNEncoder(nn.Module):
             bidirectional=True,
             dropout=dropout if num_gru_layers > 1 else 0,
         )
+        gru_output_dim = gru_hidden_size * 2
+
+        if temporal_attention_heads > 0:
+            self.temporal_attention = nn.MultiheadAttention(
+                embed_dim=gru_output_dim,
+                num_heads=temporal_attention_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.temporal_attention_norm = nn.LayerNorm(gru_output_dim)
+        else:
+            self.temporal_attention = None
+            self.temporal_attention_norm = None
 
         # Project to embedding dimension
         # BiGRU output is 2 * hidden_size
         self.projection = nn.Sequential(
-            nn.Linear(gru_hidden_size * 2, embed_dim),
+            nn.Linear(gru_output_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
 
@@ -147,6 +162,9 @@ class CRNNEncoder(nn.Module):
 
         # Temporal modelling: (B, T, C*F') → (B, T, 2*H)
         features, _ = self.gru(features)
+        if self.temporal_attention is not None and self.temporal_attention_norm is not None:
+            attn_features, _ = self.temporal_attention(features, features, features, need_weights=False)
+            features = self.temporal_attention_norm(features + attn_features)
 
         # Project to embedding space: (B, T, 2*H) → (B, T, E)
         embeddings = self.projection(features)

@@ -8,10 +8,13 @@ __version__ = "0.1.0"
 __author__ = "Lewis"
 
 _EXPORTS = {
+    "MazurkaDataset": ("dis_alignment.data", "MazurkaDataset"),
     "SWDDataset": ("dis_alignment.data", "SWDDataset"),
     "align_global_dtw": ("dis_alignment.alignment.baseline_dtw", "align_global_dtw"),
     "align_mrmsdtw": ("dis_alignment.alignment.multiscale_dtw", "align_mrmsdtw"),
     "align_with_deep_features": ("dis_alignment.model.inference", "align_with_deep_features"),
+    "evaluate_mazurka_dataset": ("dis_alignment.evaluation", "evaluate_mazurka_dataset"),
+    "evaluate_swd_dataset": ("dis_alignment.evaluation", "evaluate_swd_dataset"),
     "compute_ground_truth_alignment": ("dis_alignment.data", "compute_ground_truth_alignment"),
     "extract_chroma_cqt": ("dis_alignment.features.chroma", "extract_chroma_cqt"),
     "extract_deep_features": ("dis_alignment.model.inference", "extract_deep_features"),

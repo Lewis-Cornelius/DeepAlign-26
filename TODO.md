@@ -2,51 +2,59 @@
 
 Tracking progress for the DeepAlign-26 project (Differentiable DTW + Deep Learning for audio alignment).
 
-**Current Date:** March 10, 2026 · **Current Week:** 6 of 12
+**Current Date:** March 29, 2026  
+**Current Week:** 8 of 12
 
-## Completed (Weeks 1–6)
+## Completed
 
-### Phase 1: Foundations (Weeks 1–3)
-- [x] Environment setup: Python 3.12, PyTorch, CUDA
-- [x] SWD dataset downloader (`scripts/download_swd.py`)
-- [x] SWD data loader with pairing/annotation logic (`data/swd.py`)
-- [x] Feature extraction: CQT Chroma (`features/chroma.py`) and DLNCO (`features/dlnco.py`)
-- [x] Baseline alignment algorithms: Global DTW, MrMsDTW (`alignment/`)
-- [x] Evaluation metrics: MAE, AR, coverage (`evaluation/metrics.py`)
-- [x] Benchmark runner (`evaluation/runner.py`)
-- [x] CLI interface (`cli.py`)
-- [x] Unit tests for features and alignment (`tests/test_features.py`, `tests/test_alignment.py`)
-- [x] Config files (`config/default.yaml`, `config/deepalign.yaml`)
+### Foundations and Core Model
+- [x] Python 3.12 results environment documented and validated
+- [x] SWD downloader and verifier
+- [x] SWD data loader with pairing and measure-annotation logic
+- [x] Feature extraction: CQT chroma and DLNCO
+- [x] Baseline alignment algorithms: Global DTW and MrMsDTW wrapper
+- [x] DeepAlign encoder, Soft-DTW loss, augmentation, training loop, inference
+- [x] Dry-run training validation path
+- [x] Unit tests for features, alignment, model, and public project surface
 
-### Phase 2: Core Work (Weeks 4–6)
-- [x] Dual-stream CRNN encoder architecture (`model/encoder.py`)
-- [x] Soft-DTW loss with γ annealing scheduler (`model/soft_dtw_loss.py`)
-- [x] PyTorch Dataset with CQT extraction + variable-length collation (`model/dataset.py`)
-- [x] Full training loop: AdamW, CosineAnnealingLR, mixed precision, gradient clipping, checkpointing (`model/train.py`)
-- [x] Dry-run validation mode for training pipeline (`model/train.py --dry-run`)
-- [x] Inference pipeline: checkpoint loading + deep features + DTW alignment (`model/inference.py`)
-- [x] Data augmentation: time-stretch ±20%, pitch shift, additive noise, SpecAugment (`model/augmentation.py`)
-- [x] Unit tests for all DL components (`tests/test_model.py`)
-- [x] PyTorch/torchaudio added to project dependencies (`pyproject.toml`)
+### Results Workflow Implementation
+- [x] Unified SWD evaluator with `--methods`
+- [x] Matchmaker adapter scaffold for score-following baselines
+- [x] MazurkaBL-style dataset loader and evaluator
+- [x] Shared result CSV schema across SWD and Mazurka evaluation paths
+- [x] CLI commands: `evaluate-swd`, `evaluate-mazurka`, `visualize`, `analyze`
+- [x] Friedman / Nemenyi omnibus statistics
+- [x] Figure generation for boxplots, histograms, runtime scaling, and success criteria
+- [x] Reproducibility instructions and updated README
+
+### Validation
+- [x] `python -m dis_alignment.cli --help`
+- [x] `python -m dis_alignment.model.train --dry-run`
+- [x] `python -m pytest -q`
+- [x] Real SWD `chroma_dtw` smoke evaluation over 24 pairs
 
 ## Remaining Work
 
-### Phase 2 Continued (Week 7 — Buffer)
-- [x] Actually train the model on SWD (download data → run `train.py`) — **50 epochs, 38 min, best val_loss ≈ 0**
-- [ ] Tune the Soft-DTW smoothing parameter γ annealing schedule
-- [ ] (Optional) Experiment with attention layers in the encoder
+### Environment and External Baselines
+- [ ] Install and validate Synctoolbox in a usable Python 3.12 baseline environment or keep it in a separate mergeable results env
+- [ ] Install and validate official Matchmaker dependencies (PortAudio, FluidSynth, build tools)
+- [ ] Confirm SWD score-following baseline runs end-to-end with real data
 
-### Phase 3: Evaluation & Analysis (Weeks 8–10)
-- [ ] Establish baseline MAE/AR floor using Matchmaker and Synctoolbox on SWD test set
-- [ ] Evaluate trained DeepAlign model on SWD test data
-- [ ] Verify **Success Criterion 1:** MAE < 50ms (comparable to hand-crafted Chroma)
-- [ ] Verify **Success Criterion 2:** MAE < 20ms, AR > 98% at θ = 50ms
-- [ ] Stress test on unseen **MazurkaBL dataset** (extreme rubato)
-- [ ] Perform statistical validation (Friedman/Nemenyi significance tests)
-- [ ] Generate visualizations: warping paths, error histograms
+### SWD Results
+- [ ] Download / verify the SWD dataset locally
+- [ ] Train the final DeepAlign checkpoint on SWD
+- [ ] Tune the Soft-DTW gamma annealing schedule on real SWD runs
+- [ ] Run SWD comparison with `chroma_dtw`, `mrmsdtw`, `deepalign`, and `matchmaker`
+- [ ] Verify Success Criterion 1: MAE < 50 ms
+- [ ] Verify Success Criterion 2: MAE < 20 ms and AR@50ms > 98%
 
-### Phase 4: Writing & Submission (Weeks 11–12)
-- [ ] Synthesize findings into final technical report
-- [ ] Clean up code documentation
-- [ ] Prepare Reproducibility Instructions and GitHub repository
-- [ ] Submit final deliverables: PDF Report, Code, Trained Weights
+### Mazurka Robustness
+- [ ] Prepare a MazurkaBL-style checkout with metadata, annotations, and score files
+- [ ] Run Mazurka robustness evaluation with the same method set
+- [ ] Inspect rubato-heavy failure cases and representative alignments
+
+### Dissertation Outputs
+- [ ] Generate final SWD and Mazurka CSVs
+- [ ] Generate final figure directories from those CSVs
+- [ ] Write up the final technical report around the produced results
+- [ ] Package trained weights and final reproducibility bundle

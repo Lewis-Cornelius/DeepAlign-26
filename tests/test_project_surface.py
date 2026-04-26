@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from click.testing import CliRunner
 
 
@@ -26,6 +27,7 @@ def test_cli_help_mentions_deepalign_workflow():
     assert result.exit_code == 0
     assert "prepare-swd" in result.output
     assert "evaluate-swd" in result.output
+    assert "evaluate-mazurka" in result.output
     assert "legacy-maestro-benchmark" in result.output
     assert "DeepAlign-26 dissertation workflow" in result.output
 
@@ -53,6 +55,9 @@ def test_train_dry_run_creates_artifacts(tmp_path):
     assert len(history["train_loss"]) == 1
     assert len(history["val_loss"]) == 1
     assert (tmp_path / "best_model.pt").exists()
+    assert (tmp_path / "best_model_debug_ar50.pt").exists()
+    assert (tmp_path / "best_model_debug_mae.pt").exists()
+    assert (tmp_path / "best_model_balanced.pt").exists()
     assert (tmp_path / "final_model.pt").exists()
     assert (tmp_path / "training_history.json").exists()
 
@@ -63,6 +68,7 @@ def test_train_dry_run_creates_artifacts(tmp_path):
 
 def test_evaluate_pair_smoke(monkeypatch, tmp_path):
     from dis_alignment.data.swd import SWDPair, SWDPiece
+    from dis_alignment.evaluation import common as eval_common
     from dis_alignment.evaluation import swd as swd_eval
     from dis_alignment.features import chroma as chroma_module
     from dis_alignment.model import inference as inference_module
@@ -86,8 +92,11 @@ def test_evaluate_pair_smoke(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         swd_eval,
-        "compute_ground_truth_alignment",
-        lambda _pair: (np.array([0.0, 1.0, 2.0]), np.array([0.0, 1.0, 2.0])),
+        "compute_ground_truth_measure_alignment",
+        lambda _pair: (
+            pd.DataFrame({"event_id": ["1", "2", "3"], "time_s": [0.0, 1.0, 2.0]}),
+            pd.DataFrame({"event_id": ["1", "2", "3"], "time_s": [0.0, 1.0, 2.0]}),
+        ),
     )
     monkeypatch.setattr(
         swd_eval,
@@ -111,7 +120,7 @@ def test_evaluate_pair_smoke(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(
-        swd_eval,
+        eval_common,
         "fast_dtw_align",
         lambda a, b, distance="cosine": (
             np.array([[0, 1, 2], [0, 1, 2]], dtype=np.intp),
@@ -122,6 +131,7 @@ def test_evaluate_pair_smoke(monkeypatch, tmp_path):
 
     results = swd_eval.evaluate_pair(
         pair,
+        methods=["chroma_dtw", "deepalign"],
         encoder=object(),
         sr=10,
         chroma_hop=1,
@@ -140,6 +150,7 @@ def test_scripts_do_not_use_hardcoded_personal_paths():
         repo_root / "scripts" / "check_collapse.py",
         repo_root / "scripts" / "download_swd.py",
         repo_root / "scripts" / "evaluate_swd.py",
+        repo_root / "scripts" / "evaluate_mazurka.py",
     ]
 
     for script_path in script_paths:

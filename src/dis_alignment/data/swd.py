@@ -50,6 +50,8 @@ class SWDDataset:
     def __init__(self, root: str | Path):
         self.root = _resolve_swd_root(root)
         self.audio_dir = self.root / "01_RawData" / "audio_wav"
+        self.score_musicxml_dir = self.root / "01_RawData" / "score_musicxml"
+        self.score_midi_dir = self.root / "01_RawData" / "score_midi"
         self.annotation_dir = self.root / "02_Annotations" / "ann_audio_measure"
 
         if not self.audio_dir.exists():
@@ -114,6 +116,24 @@ class SWDDataset:
                     piece_a=piece_a,
                     piece_b=piece_b,
                 )
+
+    def get_score_path(self, lied_id: str, *, prefer: str = "musicxml") -> Path | None:
+        """Resolve the reference score file for one lied."""
+        candidates: list[Path] = []
+        search_dirs = []
+        if prefer == "musicxml":
+            search_dirs.extend([self.score_musicxml_dir, self.score_midi_dir])
+        else:
+            search_dirs.extend([self.score_midi_dir, self.score_musicxml_dir])
+
+        lied_key = _normalise_lied_id(lied_id)
+        for directory in search_dirs:
+            if not directory.exists():
+                continue
+            candidates.extend(
+                sorted(path for path in directory.iterdir() if path.is_file() and lied_key in path.stem.upper())
+            )
+        return candidates[0] if candidates else None
 
 
 def download_swd_dataset(
@@ -186,18 +206,18 @@ def compute_ground_truth_alignment(
     pair: SWDPair,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating]] | None:
     """Build measure-level correspondence targets for one SWD pair."""
-    annotations_a = _load_measure_annotations(pair.piece_a)
-    annotations_b = _load_measure_annotations(pair.piece_b)
+    annotations_a = load_swd_measure_annotations(pair.piece_a)
+    annotations_b = load_swd_measure_annotations(pair.piece_b)
     if annotations_a is None or annotations_b is None:
         return None
 
-    lookup_b = dict(zip(annotations_b["measure_id"], annotations_b["time_s"], strict=False))
-    aligned_a = annotations_a[annotations_a["measure_id"].isin(lookup_b)].copy()
+    lookup_b = dict(zip(annotations_b["event_id"], annotations_b["time_s"], strict=False))
+    aligned_a = annotations_a[annotations_a["event_id"].isin(lookup_b)].copy()
     if aligned_a.empty:
         return None
 
     times_a = aligned_a["time_s"].to_numpy(dtype=float)
-    times_b = np.array([lookup_b[measure_id] for measure_id in aligned_a["measure_id"]], dtype=float)
+    times_b = np.array([lookup_b[event_id] for event_id in aligned_a["event_id"]], dtype=float)
 
     filtered_a: list[float] = []
     filtered_b: list[float] = []
@@ -214,6 +234,47 @@ def compute_ground_truth_alignment(
         return None
 
     return np.asarray(filtered_a, dtype=float), np.asarray(filtered_b, dtype=float)
+
+
+def compute_ground_truth_measure_alignment(pair: SWDPair) -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Return aligned measure ids with measure times for both pieces."""
+    annotations_a = load_swd_measure_annotations(pair.piece_a)
+    annotations_b = load_swd_measure_annotations(pair.piece_b)
+    if annotations_a is None or annotations_b is None:
+        return None
+
+    lookup_b = dict(zip(annotations_b["event_id"], annotations_b["time_s"], strict=False))
+    aligned_a = annotations_a[annotations_a["event_id"].isin(lookup_b)].copy()
+    if aligned_a.empty:
+        return None
+
+    aligned_a["other_time_s"] = [lookup_b[event_id] for event_id in aligned_a["event_id"]]
+    aligned_a = aligned_a.rename(columns={"time_s": "time_a_s", "other_time_s": "time_b_s"})
+
+    filtered_records: list[tuple[str, float, float]] = []
+    last_a = -math.inf
+    last_b = -math.inf
+    for event_id, time_a, time_b in aligned_a[["event_id", "time_a_s", "time_b_s"]].itertuples(index=False):
+        if time_a >= last_a and time_b >= last_b:
+            filtered_records.append((event_id, float(time_a), float(time_b)))
+            last_a = float(time_a)
+            last_b = float(time_b)
+
+    if len(filtered_records) < 2:
+        return None
+
+    pair_frame = pd.DataFrame(filtered_records, columns=["event_id", "time_a_s", "time_b_s"])
+    audio_a = pair_frame.rename(columns={"time_a_s": "time_s"})[["event_id", "time_s"]]
+    audio_b = pair_frame.rename(columns={"time_b_s": "time_s"})[["event_id", "time_s"]]
+    return audio_a, audio_b
+
+
+def load_swd_measure_annotations(piece: SWDPiece) -> pd.DataFrame | None:
+    """Load normalized SWD measure annotations with stable event ids."""
+    frame = _load_measure_annotations(piece)
+    if frame is None:
+        return None
+    return frame.rename(columns={"measure_id": "event_id"})[["event_id", "time_s"]]
 
 
 def _resolve_swd_root(root: str | Path) -> Path:

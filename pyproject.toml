@@ -7,7 +7,7 @@ name = "dis-alignment"
 version = "0.1.0"
 description = "DeepAlign-26 dissertation toolkit for differentiable audio alignment on SWD"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 license = "MIT"
 authors = [{ name = "Lewis" }]
 keywords = ["audio", "music", "alignment", "soft-dtw", "deep-learning", "mir"]
@@ -16,8 +16,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Sound/Audio :: Analysis",
 ]
 
@@ -44,6 +42,23 @@ synctoolbox = [
 dl = [
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
+]
+
+transcription = [
+    # Basic Pitch's PyPI metadata pulls an old TensorFlow range on Python 3.12.
+    # Install the package itself with --no-deps, then use this extra for the ONNX runtime stack.
+    "onnxruntime>=1.25.0",
+    "resampy<0.4.3,>=0.2.2",
+    "flatbuffers>=25.0.0",
+    "protobuf>=4.25.0",
+    "coloredlogs>=15.0.0",
+    "pretty_midi>=0.2.10",
+]
+
+results = [
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "synctoolbox>=1.3.0",
 ]
 
 dev = [

@@ -25,6 +25,7 @@ def align_mrmsdtw(
     num_scales: int = 3,
     step_weights: tuple[float, float, float] = (1.0, 1.0, 2.0),
     dtw_implementation: str = "synctoolbox",
+    feature_rate: float = 50.0,
 ) -> AlignmentResult:
     """
     Perform Memory-restricted Multiscale DTW alignment.
@@ -64,6 +65,7 @@ def align_mrmsdtw(
             memory_limit_mb=memory_limit_mb,
             num_scales=num_scales,
             step_weights=step_weights,
+            feature_rate=feature_rate,
         )
     else:
         raise ValueError(f"Unknown DTW implementation: {dtw_implementation}")
@@ -91,6 +93,7 @@ def _align_synctoolbox(
     memory_limit_mb: int,
     num_scales: int,
     step_weights: tuple[float, float, float],
+    feature_rate: float = 50.0,
 ) -> tuple[NDArray[np.intp], float]:
     """
     Perform alignment using synctoolbox's MrMsDTW implementation.
@@ -115,13 +118,13 @@ def _align_synctoolbox(
         ) from e
     
     # Compute optimal transposition for better alignment
-    opt_shift = compute_optimal_chroma_shift(
-        features_query, features_reference
-    )
-    
-    # Apply shift to query features
-    if opt_shift != 0:
-        features_query = np.roll(features_query, opt_shift, axis=0)
+    # Only compute chroma shift on short sequences to avoid full DTW on long ones
+    if features_query.shape[1] < 5000 and features_reference.shape[1] < 5000:
+        opt_shift = compute_optimal_chroma_shift(
+            features_query, features_reference
+        )
+        if opt_shift != 0:
+            features_query = np.roll(features_query, opt_shift, axis=0)
     
     # Convert step weights to synctoolbox format
     step_sizes = np.array([[1, 0], [0, 1], [1, 1]])
@@ -131,15 +134,15 @@ def _align_synctoolbox(
     wp = sync_via_mrmsdtw(
         f_chroma1=features_query,
         f_chroma2=features_reference,
-        input_feature_rate=1.0,  # Features already at target rate
+        input_feature_rate=feature_rate,
         step_sizes=step_sizes,
         step_weights=weights,
         threshold_rec=memory_limit_mb * 1024 * 1024 // 8,  # Convert to cell count
         verbose=False,
     )
     
-    # synctoolbox returns path as (N, 2), convert to (2, N)
-    path = wp.T.astype(np.intp)
+    # synctoolbox returns path as (2, N)
+    path = wp.astype(np.intp)
     
     # Compute path cost
     cost = _compute_path_cost(features_query, features_reference, path)

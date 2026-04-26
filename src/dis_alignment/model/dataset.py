@@ -1,10 +1,9 @@
-"""PyTorch Dataset for SWD audio pairs with CQT spectrogram extraction.
+"""PyTorch Dataset for SWD audio pairs with aligned-window sampling."""
 
-Handles loading audio pairs, computing CQT spectrograms, and
-applying augmentations for training the DeepAlign-26 model.
-"""
+from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,40 +11,49 @@ import librosa
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from torch import Tensor
 from torch.utils.data import Dataset
 
-from dis_alignment.data.swd import SWDDataset, SWDPair, load_swd_audio
+from dis_alignment.data.swd import (
+    SWDDataset,
+    SWDPair,
+    compute_ground_truth_measure_alignment,
+    load_swd_audio,
+)
+from dis_alignment.model.cqt_cache import SpectrogramCache, slice_log_cqt, standardize_log_cqt
 from dis_alignment.model.augmentation import AudioAugmentor
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class AlignedMeasureWindow:
+    """One shared aligned segment anchored on SWD measure annotations."""
+
+    start_event_id: str
+    end_boundary_event_id: str | None
+    start_a_s: float
+    end_a_s: float
+    start_b_s: float
+    end_b_s: float
+    num_measures: int
+    anchor_event_ids: tuple[str, ...]
+    anchor_a_s: tuple[float, ...]
+    anchor_b_s: tuple[float, ...]
+
+
 class SWDPairDataset(Dataset):
     """
-    PyTorch Dataset for pairs of SWD recordings.
+    PyTorch dataset for pairs of SWD recordings.
 
-    Each item returns CQT spectrograms for a pair of recordings
-    of the same lied, suitable for training with Soft-DTW loss.
-
-    Args:
-        swd: SWDDataset instance.
-        sr: Sample rate for audio loading.
-        hop_length: Hop length for CQT computation.
-            Default 220 samples at 22050 Hz = ~10ms (as per plan).
-        n_bins: Number of CQT frequency bins.
-            Default 84 = 7 octaves × 12 bins per octave.
-        bins_per_octave: CQT resolution.
-        max_length_sec: Maximum audio length in seconds.
-            Longer pieces are randomly cropped during training.
-        augmentor: Optional AudioAugmentor for data augmentation.
-        performances: Limit to specific performance IDs.
-        lieder: Limit to specific lied numbers.
+    Each item returns CQT spectrograms for a pair of recordings of the same lied.
+    In the default ``aligned_measures`` mode, the two waveforms are cropped to the
+    same shared measure window before feature extraction. This keeps the training
+    target musically aligned instead of using independent random crops.
     """
 
     def __init__(
         self,
-        swd: SWDDataset,
+        swd: SWDDataset | None = None,
         sr: int = 22050,
         hop_length: int = 220,
         n_bins: int = 84,
@@ -54,7 +62,20 @@ class SWDPairDataset(Dataset):
         augmentor: AudioAugmentor | None = None,
         performances: list[str] | None = None,
         lieder: list[str] | None = None,
+        *,
+        pairs: list[SWDPair] | None = None,
+        segment_sampling: str = "aligned_measures",
+        samples_per_epoch: int | None = None,
+        deterministic: bool = False,
+        random_seed: int = 42,
+        cache_spectrograms: bool = False,
+        cache_root: str | Path | None = None,
     ):
+        if pairs is None:
+            if swd is None:
+                raise ValueError("Provide either an SWDDataset or an explicit pair list.")
+            pairs = list(swd.iter_pairs(performances=performances, lieder=lieder))
+
         self.sr = sr
         self.hop_length = hop_length
         self.n_bins = n_bins
@@ -62,66 +83,264 @@ class SWDPairDataset(Dataset):
         self.max_length_sec = max_length_sec
         self.augmentor = augmentor
         self.max_samples = int(max_length_sec * sr)
+        self.segment_sampling = segment_sampling
+        self.samples_per_epoch = samples_per_epoch
+        self.deterministic = deterministic
+        self._rng = np.random.default_rng(random_seed)
+        self.cache_spectrograms = cache_spectrograms
+        self.cache_root = Path(cache_root) if cache_root is not None else None
 
-        # Collect all pairs
-        self.pairs: list[SWDPair] = list(
-            swd.iter_pairs(performances=performances, lieder=lieder)
+        if self.segment_sampling not in {"aligned_measures", "independent_random"}:
+            raise ValueError(
+                "segment_sampling must be one of {'aligned_measures', 'independent_random'}"
+            )
+
+        self.pairs = list(pairs)
+        self._windows_by_pair_id: dict[str, list[AlignedMeasureWindow]] = {}
+        if self.segment_sampling == "aligned_measures":
+            self._windows_by_pair_id = {
+                pair.pair_id: self._build_aligned_windows(pair) for pair in self.pairs
+            }
+        self._spectrogram_cache: SpectrogramCache | None = None
+        if self.cache_spectrograms and self.cache_root is not None and self.augmentor is None:
+            self._spectrogram_cache = SpectrogramCache(
+                self.cache_root,
+                sr=self.sr,
+                hop_length=self.hop_length,
+                n_bins=self.n_bins,
+                bins_per_octave=self.bins_per_octave,
+            )
+        elif self.cache_spectrograms and self.augmentor is not None:
+            logger.warning(
+                "Spectrogram caching is disabled because waveform augmentation is enabled."
+            )
+
+        logger.info(
+            "Created dataset with %s pairs, sampling=%s, samples_per_epoch=%s, cache=%s",
+            len(self.pairs),
+            self.segment_sampling,
+            self.samples_per_epoch,
+            bool(self._spectrogram_cache),
         )
 
-        logger.info(f"Created dataset with {len(self.pairs)} pairs")
-
     def __len__(self) -> int:
+        if self.samples_per_epoch is not None:
+            return self.samples_per_epoch
         return len(self.pairs)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """
         Get a training sample.
 
-        Returns:
-            Dict with keys:
-                - spec_a: CQT spectrogram A, shape (1, freq_bins, time)
-                - spec_b: CQT spectrogram B, shape (1, freq_bins, time)
-                - pair_id: String identifier for the pair
+        Returns a dict with spectrogram tensors and lightweight metadata useful for
+        debugging aligned-window selection.
         """
-        pair = self.pairs[idx]
+        if not self.pairs:
+            raise IndexError("SWDPairDataset is empty")
 
-        # Load audio
-        audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
-        audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
+        pair = self.pairs[idx % len(self.pairs)]
 
-        # Random crop if too long
-        audio_a = self._maybe_crop(audio_a)
-        audio_b = self._maybe_crop(audio_b)
+        window = None
+        spec_a: NDArray[np.float32] | None = None
+        spec_b: NDArray[np.float32] | None = None
+        if self.segment_sampling == "aligned_measures":
+            window = self._select_aligned_window(pair)
+            if window is not None and self._spectrogram_cache is not None:
+                log_cqt_a = self._spectrogram_cache.load_or_compute(pair.piece_a.audio_path)
+                log_cqt_b = self._spectrogram_cache.load_or_compute(pair.piece_b.audio_path)
+                spec_a = standardize_log_cqt(
+                    slice_log_cqt(
+                        log_cqt_a,
+                        start_s=window.start_a_s,
+                        end_s=window.end_a_s,
+                        sr=self.sr,
+                        hop_length=self.hop_length,
+                    )
+                )
+                spec_b = standardize_log_cqt(
+                    slice_log_cqt(
+                        log_cqt_b,
+                        start_s=window.start_b_s,
+                        end_s=window.end_b_s,
+                        sr=self.sr,
+                        hop_length=self.hop_length,
+                    )
+                )
+            elif window is not None:
+                audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
+                audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
+                audio_a = self._crop_audio_window(audio_a, window.start_a_s, window.end_a_s)
+                audio_b = self._crop_audio_window(audio_b, window.start_b_s, window.end_b_s)
+            else:
+                logger.warning(
+                    "Falling back to independent crops for %s because no aligned windows were found.",
+                    pair.pair_id,
+                )
+                audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
+                audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
+                audio_a = self._maybe_crop(audio_a)
+                audio_b = self._maybe_crop(audio_b)
+        else:
+            audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
+            audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
+            audio_a = self._maybe_crop(audio_a)
+            audio_b = self._maybe_crop(audio_b)
 
-        # Apply augmentation (only to one stream for asymmetry)
-        if self.augmentor is not None:
-            audio_tensor_a = torch.from_numpy(audio_a).float()
-            audio_a = self.augmentor(audio_tensor_a).numpy()
+        if spec_a is None or spec_b is None:
+            if self.augmentor is not None:
+                audio_tensor_a = torch.from_numpy(audio_a).float()
+                audio_a = self.augmentor(audio_tensor_a).numpy()
 
-        # Compute CQT spectrograms
-        spec_a = self._compute_cqt(audio_a)
-        spec_b = self._compute_cqt(audio_b)
+            spec_a = self._compute_cqt(audio_a)
+            spec_b = self._compute_cqt(audio_b)
 
-        return {
-            "spec_a": torch.from_numpy(spec_a).float().unsqueeze(0),  # (1, F, T)
-            "spec_b": torch.from_numpy(spec_b).float().unsqueeze(0),  # (1, F, T)
+        sample: dict[str, Any] = {
+            "spec_a": torch.from_numpy(spec_a).float().unsqueeze(0),
+            "spec_b": torch.from_numpy(spec_b).float().unsqueeze(0),
             "pair_id": pair.pair_id,
+            "segment_sampling": self.segment_sampling,
         }
+        if window is not None:
+            anchor_frames_a, anchor_frames_b = self._anchor_frames_for_window(window, spec_a.shape[1], spec_b.shape[1])
+            sample.update(
+                {
+                    "window_start_event_id": window.start_event_id,
+                    "window_end_boundary_event_id": window.end_boundary_event_id,
+                    "window_duration_a_s": (window.end_a_s - window.start_a_s),
+                    "window_duration_b_s": (window.end_b_s - window.start_b_s),
+                    "window_num_measures": window.num_measures,
+                    "anchor_event_ids": list(window.anchor_event_ids),
+                    "anchor_frame_indices_a": anchor_frames_a,
+                    "anchor_frame_indices_b": anchor_frames_b,
+                }
+            )
 
-    def _maybe_crop(self, audio: NDArray) -> NDArray:
-        """Randomly crop audio if longer than max_length_sec."""
-        if len(audio) > self.max_samples:
-            start = np.random.randint(0, len(audio) - self.max_samples)
-            return audio[start : start + self.max_samples]
-        return audio
+        return sample
 
-    def _compute_cqt(self, audio: NDArray) -> NDArray:
-        """
-        Compute CQT spectrogram.
+    def _anchor_frames_for_window(
+        self,
+        window: AlignedMeasureWindow,
+        n_frames_a: int,
+        n_frames_b: int,
+    ) -> tuple[list[int], list[int]]:
+        if not window.anchor_event_ids:
+            return [], []
+        anchor_frames_a = [
+            int(np.clip(round((time_s - window.start_a_s) * self.sr / self.hop_length), 0, n_frames_a - 1))
+            for time_s in window.anchor_a_s
+        ]
+        anchor_frames_b = [
+            int(np.clip(round((time_s - window.start_b_s) * self.sr / self.hop_length), 0, n_frames_b - 1))
+            for time_s in window.anchor_b_s
+        ]
+        return anchor_frames_a, anchor_frames_b
 
-        Returns:
-            Log-magnitude CQT of shape (n_bins, n_frames).
-        """
+    def _select_aligned_window(self, pair: SWDPair) -> AlignedMeasureWindow | None:
+        windows = self._windows_by_pair_id.get(pair.pair_id, [])
+        if not windows:
+            return None
+        if self.deterministic:
+            return windows[len(windows) // 2]
+        return windows[int(self._rng.integers(0, len(windows)))]
+
+    def _build_aligned_windows(self, pair: SWDPair) -> list[AlignedMeasureWindow]:
+        alignment = compute_ground_truth_measure_alignment(pair)
+        if alignment is None:
+            return []
+
+        ann_a, ann_b = alignment
+        event_ids = ann_a["event_id"].astype(str).tolist()
+        times_a = ann_a["time_s"].astype(float).to_numpy()
+        times_b = ann_b["time_s"].astype(float).to_numpy()
+
+        if len(event_ids) < 2:
+            return []
+
+        windows: list[AlignedMeasureWindow] = []
+        for start_idx in range(len(event_ids) - 1):
+            best_end_idx = None
+            for end_idx in range(start_idx + 1, len(event_ids)):
+                duration_a = float(times_a[end_idx] - times_a[start_idx])
+                duration_b = float(times_b[end_idx] - times_b[start_idx])
+                if max(duration_a, duration_b) <= self.max_length_sec:
+                    best_end_idx = end_idx
+                else:
+                    break
+
+            if best_end_idx is None:
+                fallback_end_idx = start_idx + 1
+                anchor_ids = tuple(event_ids[start_idx:fallback_end_idx])
+                anchor_a = tuple(float(value) for value in times_a[start_idx:fallback_end_idx])
+                anchor_b = tuple(float(value) for value in times_b[start_idx:fallback_end_idx])
+                windows.append(
+                    AlignedMeasureWindow(
+                        start_event_id=event_ids[start_idx],
+                        end_boundary_event_id=event_ids[fallback_end_idx],
+                        start_a_s=float(times_a[start_idx]),
+                        end_a_s=float(times_a[start_idx] + self.max_length_sec),
+                        start_b_s=float(times_b[start_idx]),
+                        end_b_s=float(times_b[start_idx] + self.max_length_sec),
+                        num_measures=1,
+                        anchor_event_ids=anchor_ids,
+                        anchor_a_s=anchor_a,
+                        anchor_b_s=anchor_b,
+                    )
+                )
+                continue
+
+            anchor_ids = tuple(event_ids[start_idx:best_end_idx])
+            anchor_a = tuple(float(value) for value in times_a[start_idx:best_end_idx])
+            anchor_b = tuple(float(value) for value in times_b[start_idx:best_end_idx])
+            windows.append(
+                AlignedMeasureWindow(
+                    start_event_id=event_ids[start_idx],
+                    end_boundary_event_id=event_ids[best_end_idx],
+                    start_a_s=float(times_a[start_idx]),
+                    end_a_s=float(times_a[best_end_idx]),
+                    start_b_s=float(times_b[start_idx]),
+                    end_b_s=float(times_b[best_end_idx]),
+                    num_measures=best_end_idx - start_idx,
+                    anchor_event_ids=anchor_ids,
+                    anchor_a_s=anchor_a,
+                    anchor_b_s=anchor_b,
+                )
+            )
+
+        return windows
+
+    def _maybe_crop(self, audio: NDArray[np.floating]) -> NDArray[np.floating]:
+        """Crop audio to max_length_sec, randomly for training and centrally for validation."""
+        if len(audio) <= self.max_samples:
+            return audio
+
+        if self.deterministic:
+            start = (len(audio) - self.max_samples) // 2
+        else:
+            start = int(self._rng.integers(0, len(audio) - self.max_samples + 1))
+        return audio[start : start + self.max_samples]
+
+    def _crop_audio_window(
+        self,
+        audio: NDArray[np.floating],
+        start_s: float,
+        end_s: float,
+    ) -> NDArray[np.floating]:
+        """Crop one waveform to the requested aligned time window."""
+        if len(audio) == 0:
+            return audio
+
+        start_sample = max(0, int(round(start_s * self.sr)))
+        end_sample = max(start_sample + 1, int(round(end_s * self.sr)))
+        start_sample = min(start_sample, len(audio) - 1)
+        end_sample = min(end_sample, len(audio))
+
+        cropped = audio[start_sample:end_sample]
+        if len(cropped) > self.max_samples:
+            cropped = cropped[: self.max_samples]
+        return cropped
+
+    def _compute_cqt(self, audio: NDArray[np.floating]) -> NDArray[np.floating]:
+        """Compute a standardized log-magnitude CQT."""
         cqt = librosa.cqt(
             y=audio.astype(np.float32),
             sr=self.sr,
@@ -130,28 +349,17 @@ class SWDPairDataset(Dataset):
             bins_per_octave=self.bins_per_octave,
         )
 
-        # Convert to log magnitude
         cqt_mag = np.abs(cqt)
         cqt_log = librosa.amplitude_to_db(cqt_mag, ref=np.max)
-
-        # Standardize to zero-mean, unit-variance
         cqt_log = (cqt_log - cqt_log.mean()) / (cqt_log.std() + 1e-8)
-
         return cqt_log
 
 
 def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
     """
-    Custom collate function for variable-length spectrograms.
+    Collate variable-length spectrograms by padding on the time axis.
 
-    Pads all spectrograms in the batch to the same length along the
-    time axis.
-
-    Args:
-        batch: List of dataset items.
-
-    Returns:
-        Batched dict with padded tensors and length info.
+    Any extra metadata fields are preserved as simple lists.
     """
     max_len_a = max(item["spec_a"].shape[-1] for item in batch)
     max_len_b = max(item["spec_b"].shape[-1] for item in batch)
@@ -166,7 +374,6 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
         sa = item["spec_a"]
         sb = item["spec_b"]
 
-        # Pad time dimension
         pad_a = max_len_a - sa.shape[-1]
         pad_b = max_len_b - sb.shape[-1]
 
@@ -181,10 +388,22 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
         lengths_b.append(item["spec_b"].shape[-1])
         pair_ids.append(item["pair_id"])
 
-    return {
+    collated: dict[str, Any] = {
         "spec_a": torch.stack(specs_a),
         "spec_b": torch.stack(specs_b),
         "lengths_a": torch.tensor(lengths_a),
         "lengths_b": torch.tensor(lengths_b),
         "pair_ids": pair_ids,
     }
+
+    extra_keys = {
+        key
+        for item in batch
+        for key in item
+        if key not in {"spec_a", "spec_b", "pair_id"}
+    }
+    for key in sorted(extra_keys):
+        values = [item.get(key) for item in batch]
+        collated[key] = values
+
+    return collated

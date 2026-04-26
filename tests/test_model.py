@@ -4,12 +4,63 @@ All tests use synthetic data — no SWD download required.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 import torch.nn as nn
 
 from dis_alignment.model.encoder import CRNNEncoder, ConvBlock, DeepAlignModel
 from dis_alignment.model.soft_dtw_loss import GammaScheduler, SoftDTWLoss
+
+
+def _make_pair(tmp_path, lied_id: str, performance_a: str = "HU33", performance_b: str = "SC06"):
+    from dis_alignment.data.swd import SWDPair, SWDPiece
+
+    piece_a = SWDPiece(
+        piece_id=f"{lied_id}_{performance_a}",
+        lied_id=lied_id,
+        performance_id=performance_a,
+        audio_path=tmp_path / f"{lied_id}_{performance_a}.wav",
+    )
+    piece_b = SWDPiece(
+        piece_id=f"{lied_id}_{performance_b}",
+        lied_id=lied_id,
+        performance_id=performance_b,
+        audio_path=tmp_path / f"{lied_id}_{performance_b}.wav",
+    )
+    return SWDPair(
+        pair_id=f"{lied_id}_{performance_a}_{performance_b}",
+        lied_id=lied_id,
+        piece_a=piece_a,
+        piece_b=piece_b,
+    )
+
+
+def _patch_aligned_sampling(monkeypatch):
+    from dis_alignment.model import dataset as dataset_module
+
+    monkeypatch.setattr(
+        dataset_module,
+        "compute_ground_truth_measure_alignment",
+        lambda pair: (
+            pd.DataFrame(
+                {"event_id": ["1", "2", "3", "4"], "time_s": [0.0, 8.0, 18.0, 28.0]}
+            ),
+            pd.DataFrame(
+                {"event_id": ["1", "2", "3", "4"], "time_s": [0.0, 9.0, 19.0, 29.0]}
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        dataset_module,
+        "load_swd_audio",
+        lambda piece, sr=10: (np.zeros(400, dtype=np.float32), sr),
+    )
+    monkeypatch.setattr(
+        dataset_module.SWDPairDataset,
+        "_compute_cqt",
+        lambda self, audio: np.ones((2, max(1, len(audio) // 10)), dtype=np.float32),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -302,3 +353,114 @@ class TestCollateVariableLength:
         assert collated["lengths_a"].tolist() == [50, 80]
         assert collated["lengths_b"].tolist() == [30, 60]
         assert len(collated["pair_ids"]) == 2
+
+
+class TestSWDPairDatasetSampling:
+    """Tests for aligned-window SWD segment sampling."""
+
+    def test_aligned_sampling_returns_shared_measure_window(self, monkeypatch, tmp_path):
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair = _make_pair(tmp_path, "D911-01")
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+        )
+
+        item = dataset[0]
+
+        assert item["pair_id"] == pair.pair_id
+        assert item["segment_sampling"] == "aligned_measures"
+        assert item["window_start_event_id"] == "2"
+        assert item["window_end_boundary_event_id"] == "3"
+        assert item["window_duration_a_s"] <= 12.0
+        assert item["window_duration_b_s"] <= 12.0
+
+    def test_validation_sampling_is_deterministic(self, monkeypatch, tmp_path):
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair = _make_pair(tmp_path, "D911-02")
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+        )
+
+        first = dataset[0]
+        second = dataset[0]
+
+        assert first["window_start_event_id"] == second["window_start_event_id"]
+        assert first["window_end_boundary_event_id"] == second["window_end_boundary_event_id"]
+        assert first["window_duration_a_s"] == second["window_duration_a_s"]
+        assert first["window_duration_b_s"] == second["window_duration_b_s"]
+
+    def test_training_sampling_randomizes_aligned_windows(self, monkeypatch, tmp_path):
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair = _make_pair(tmp_path, "D911-03")
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=False,
+            random_seed=7,
+        )
+
+        seen = {
+            (dataset[0]["window_start_event_id"], dataset[0]["window_end_boundary_event_id"])
+            for _ in range(12)
+        }
+
+        assert len(seen) > 1
+
+    def test_samples_per_epoch_repeats_pair_ownership_without_leakage(self, monkeypatch, tmp_path):
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair_a = _make_pair(tmp_path, "D911-04")
+        pair_b = _make_pair(tmp_path, "D911-05")
+
+        dataset = SWDPairDataset(
+            pairs=[pair_a, pair_b],
+            sr=10,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+            samples_per_epoch=6,
+        )
+
+        observed_pair_ids = [dataset[idx]["pair_id"] for idx in range(len(dataset))]
+
+        assert len(dataset) == 6
+        assert set(observed_pair_ids) == {pair_a.pair_id, pair_b.pair_id}
+
+
+class TestTrainingPairSplit:
+    """Tests for pair-level train/validation splitting."""
+
+    def test_split_swd_pairs_has_no_overlap(self, tmp_path):
+        from dis_alignment.model.train import _split_swd_pairs
+
+        pairs = [_make_pair(tmp_path, f"D911-{idx:02d}") for idx in range(1, 6)]
+
+        train_pairs, val_pairs = _split_swd_pairs(pairs, val_split=0.4, random_seed=3)
+
+        train_ids = {pair.pair_id for pair in train_pairs}
+        val_ids = {pair.pair_id for pair in val_pairs}
+
+        assert train_ids
+        assert val_ids
+        assert train_ids.isdisjoint(val_ids)
+        assert train_ids | val_ids == {pair.pair_id for pair in pairs}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Thin wrapper around the package SWD evaluator."""
+"""Thin wrapper around the package Mazurka evaluator."""
 
 from __future__ import annotations
 
@@ -11,21 +11,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate DeepAlign-26 on SWD")
-    parser.add_argument("--swd-path", type=str, required=True, help="Path to the extracted SWD root")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Optional DeepAlign checkpoint. Omit for baseline-only evaluation.",
-    )
+    parser = argparse.ArgumentParser(description="Evaluate DeepAlign-26 on MazurkaBL-style data")
+    parser.add_argument("--dataset-path", type=str, required=True, help="Path to the Mazurka root")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Optional DeepAlign checkpoint")
     parser.add_argument(
         "--methods",
         type=str,
         default=None,
         help="Comma-separated methods: chroma_dtw,mrmsdtw,deepalign,matchmaker",
     )
-    parser.add_argument("--output", type=str, default="results/swd_evaluation.csv")
+    parser.add_argument("--output", type=str, default="results/mazurka_evaluation.csv")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--quiet", action="store_true", help="Disable the progress bar")
     parser.add_argument("--matchmaker-method", type=str, default="arzt")
@@ -33,16 +28,16 @@ def main() -> None:
     parser.add_argument("--matchmaker-frame-rate", type=int, default=100)
     args = parser.parse_args()
 
-    from dis_alignment.data import SWDDataset
+    from dis_alignment.data import MazurkaDataset
     from dis_alignment.evaluation import (
         check_success_criteria,
-        evaluate_swd_dataset,
+        evaluate_mazurka_dataset,
         save_evaluation_results,
         summarize_evaluation,
     )
 
-    dataset = SWDDataset(args.swd_path)
-    results = evaluate_swd_dataset(
+    dataset = MazurkaDataset(args.dataset_path)
+    results = evaluate_mazurka_dataset(
         dataset,
         checkpoint_path=args.checkpoint,
         device=args.device,
@@ -55,7 +50,7 @@ def main() -> None:
     output_path = save_evaluation_results(results, args.output)
     print(f"Saved results to {output_path}")
 
-    print("\n=== SWD Summary ===")
+    print("\n=== Mazurka Summary ===")
     for method, stats in summarize_evaluation(results).items():
         print(f"\n{method}")
         print(f"  pairs:       {int(stats['pairs'])}")
