@@ -732,3 +732,52 @@ def test_merge_evaluation_results_deduplicates_by_pair_and_method(tmp_path):
     assert set(merged["method"]) == {"chroma_dtw", "mrmsdtw", "deepalign"}
     deepalign_row = merged[merged["method"] == "deepalign"].iloc[0]
     assert deepalign_row["mae"] == 0.09
+
+
+def test_deepalign_decode_variants_are_not_collapsed(tmp_path):
+    base_row = {
+        "dataset": "swd",
+        "pair_id": "pair-1",
+        "group_id": "lied-1",
+        "piece_a_id": "a",
+        "piece_b_id": "b",
+        "method": "deepalign",
+        "median_ae": 0.08,
+        "ar_50ms": 0.90,
+        "ar_100ms": 0.95,
+        "ar_200ms": 0.98,
+        "runtime_s": 2.0,
+        "duration_s": 10.0,
+        "memory_mb": np.nan,
+        "n_gt_points": 32,
+    }
+    unconstrained = pd.DataFrame([{**base_row, "mae": 0.10, "deep_decode": "unconstrained"}])
+    fused = pd.DataFrame(
+        [{**base_row, "mae": 0.05, "deep_decode": "deepalign_transcription_fused"}]
+    )
+
+    unconstrained_path = tmp_path / "unconstrained.csv"
+    fused_path = tmp_path / "fused.csv"
+    unconstrained.to_csv(unconstrained_path, index=False)
+    fused.to_csv(fused_path, index=False)
+
+    merged = eval_common.merge_evaluation_results([unconstrained_path, fused_path])
+    assert len(merged) == 2
+    assert set(merged["deep_decode"]) == {"unconstrained", "deepalign_transcription_fused"}
+
+    summary = eval_common.summarize_evaluation(merged)
+    assert set(summary) == {
+        "deepalign:unconstrained",
+        "deepalign:deepalign_transcription_fused",
+    }
+
+    ambiguous = eval_common.check_success_criteria(merged)
+    assert not ambiguous["available"]
+    assert "Multiple DeepAlign variants" in ambiguous["error"]
+
+    fused_success = eval_common.check_success_criteria(
+        merged,
+        candidate_deep_decode="deepalign_transcription_fused",
+    )
+    assert fused_success["available"]
+    assert fused_success["mae_seconds"] == 0.05

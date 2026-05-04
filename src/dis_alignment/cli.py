@@ -81,6 +81,8 @@ def _print_evaluation_summary(results, candidate_method: str = "deepalign") -> N
             f"{'PASS' if success['criterion_2_ar_pass'] else 'FAIL'} "
             f"[{success['ar_50ms'] * 100:.1f}%]"
         )
+    elif "error" in success:
+        click.echo(f"\nSuccess criteria not aggregated: {success['error']}")
 
 
 @click.group()
@@ -294,6 +296,8 @@ def train(
 @click.option("--output", "-o", default="results/swd_evaluation.csv", help="Output CSV path")
 @click.option("--device", type=str, default=None)
 @click.option("--cache-root", type=click.Path(), default=None, help="Directory for cached full-song CQTs")
+@click.option("--pool-size", type=int, default=2, help="Temporal pooling factor for DeepAlign features")
+@click.option("--deep-distance", type=click.Choice(["sqeuclidean", "cosine"]), default="sqeuclidean", help="DTW distance for DeepAlign feature comparisons")
 @click.option(
     "--deep-decode",
     default="unconstrained",
@@ -322,6 +326,8 @@ def evaluate_swd(
     output: str,
     device: str | None,
     cache_root: str | None,
+    pool_size: int,
+    deep_distance: str,
     deep_decode: str,
     band_radius_frames: int | None,
     transcription_cache_root: str | None,
@@ -350,6 +356,8 @@ def evaluate_swd(
         device=device,
         methods=methods,
         cache_root=cache_root,
+        pool_size=pool_size,
+        deep_distance=deep_distance,
         deep_decode=deep_decode,
         band_radius_frames=band_radius_frames,
         transcription_cache_root=transcription_cache_root,
@@ -382,6 +390,8 @@ def evaluate_swd(
 @click.option("--output", "-o", default="results/mazurka_evaluation.csv", help="Output CSV path")
 @click.option("--device", type=str, default=None)
 @click.option("--cache-root", type=click.Path(), default=None, help="Directory for cached full-song CQTs")
+@click.option("--pool-size", type=int, default=2, help="Temporal pooling factor for DeepAlign features")
+@click.option("--deep-distance", type=click.Choice(["sqeuclidean", "cosine"]), default="sqeuclidean", help="DTW distance for DeepAlign feature comparisons")
 @click.option(
     "--deep-decode",
     default="unconstrained",
@@ -409,6 +419,8 @@ def evaluate_mazurka(
     output: str,
     device: str | None,
     cache_root: str | None,
+    pool_size: int,
+    deep_distance: str,
     deep_decode: str,
     band_radius_frames: int | None,
     transcription_cache_root: str | None,
@@ -436,6 +448,8 @@ def evaluate_mazurka(
         device=device,
         methods=methods,
         cache_root=cache_root,
+        pool_size=pool_size,
+        deep_distance=deep_distance,
         deep_decode=deep_decode,
         band_radius_frames=band_radius_frames,
         transcription_cache_root=transcription_cache_root,
@@ -467,7 +481,7 @@ def evaluate_mazurka(
 @click.option("--output", "-o", default="results/merged_evaluation.csv", help="Output CSV path")
 def merge_results(results_paths: tuple[str, ...], output: str) -> None:
     """Merge evaluation CSVs produced in separate environments."""
-    from dis_alignment.evaluation import merge_evaluation_results, save_evaluation_results
+    from dis_alignment.evaluation import add_method_variant_column, merge_evaluation_results, save_evaluation_results
 
     if not results_paths:
         raise click.ClickException("Provide at least one results CSV to merge.")
@@ -484,6 +498,9 @@ def merge_results(results_paths: tuple[str, ...], output: str) -> None:
     click.echo(f"Saved merged evaluation results to {output_path}")
     click.echo(f"Merged rows: {len(merged)}")
     click.echo(f"Methods: {', '.join(sorted(merged['method'].astype(str).unique()))}")
+    labelled = add_method_variant_column(merged)
+    if "method_variant" in labelled.columns:
+        click.echo(f"Report labels: {', '.join(sorted(labelled['method_variant'].astype(str).unique()))}")
     click.echo(f"Datasets: {', '.join(sorted(merged['dataset'].astype(str).unique()))}")
 
 
@@ -546,8 +563,11 @@ def analyze(results_path: str, baseline: str, candidate: str, metric: str) -> No
         runtime_efficiency_analysis,
     )
 
-    results = pd.read_csv(results_path)
-    available_methods = sorted(results["method"].unique()) if "method" in results.columns else []
+    from dis_alignment.evaluation import add_method_variant_column
+
+    results = add_method_variant_column(pd.read_csv(results_path))
+    method_col = "method_variant" if "method_variant" in results.columns else "method"
+    available_methods = sorted(results[method_col].unique()) if method_col in results.columns else []
 
     if len(available_methods) >= 3:
         click.echo("=== Friedman / Nemenyi ===")

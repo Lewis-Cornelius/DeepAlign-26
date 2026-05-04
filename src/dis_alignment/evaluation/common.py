@@ -25,6 +25,20 @@ DEEP_DECODE_MODES = (
     "deepalign_transcription_guided",
     "deepalign_score_guided_refined",
 )
+DEEP_VARIANT_COLUMNS = (
+    "deep_decode",
+    "band_radius_frames",
+    "pool_size",
+    "deep_distance",
+    "fusion_deep_weight",
+    "fusion_onset_weight",
+    "fusion_note_weight",
+    "fusion_dlnco_weight",
+    "fusion_chroma_weight",
+    "refine_window_sec",
+    "score_refine_radius_sec",
+)
+METHOD_VARIANT_COLUMN = "method_variant"
 
 
 def parse_methods(
@@ -82,6 +96,22 @@ def parse_deep_decode(mode: str | None) -> str:
             f"Supported modes: {', '.join(DEEP_DECODE_MODES)}."
         )
     return resolved
+
+
+def add_method_variant_column(results: pd.DataFrame) -> pd.DataFrame:
+    """Return results with a reporting label that separates DeepAlign variants when needed."""
+    if results.empty or METHOD_VARIANT_COLUMN in results.columns or "method" not in results.columns:
+        return results
+    if "deep_decode" not in results.columns or not _needs_method_variant_labels(results):
+        return results
+
+    labelled = results.copy()
+    method = labelled["method"].astype(str)
+    decode = labelled["deep_decode"].map(_normalize_variant_value)
+    deep_mask = method.eq("deepalign") & decode.ne("")
+    labelled[METHOD_VARIANT_COLUMN] = method
+    labelled.loc[deep_mask, METHOD_VARIANT_COLUMN] = method[deep_mask] + ":" + decode[deep_mask]
+    return labelled
 
 
 def fast_dtw_align(
@@ -142,6 +172,7 @@ def evaluate_pairwise_methods(
     audio_b_path: str | Path | None = None,
     cache_root: str | Path | None = None,
     deep_decode: str = "unconstrained",
+    deep_distance: str = "sqeuclidean",
     band_radius_frames: int | None = None,
     transcription_cache_root: str | Path | None = None,
     fusion_deep_weight: float = 1.0,
@@ -239,7 +270,7 @@ def evaluate_pairwise_methods(
         pooled_b = temporal_pool(feat_b, pool_size=pool_size)
         refinement_features: tuple[np.ndarray, np.ndarray] | None = None
         if resolved_deep_decode == "unconstrained":
-            path_d, _, runtime_d = fast_dtw_align(pooled_a, pooled_b, distance="sqeuclidean")
+            path_d, _, runtime_d = fast_dtw_align(pooled_a, pooled_b, distance=deep_distance)
         elif resolved_deep_decode == "diagonal_band":
             resolved_band = band_radius_frames if band_radius_frames is not None else 150
             lower, upper = _diagonal_band_bounds(pooled_a.shape[1], pooled_b.shape[1], resolved_band)
@@ -248,7 +279,7 @@ def evaluate_pairwise_methods(
                 pooled_b,
                 lower_bounds=lower,
                 upper_bounds=upper,
-                distance="sqeuclidean",
+                distance=deep_distance,
             )
         elif resolved_deep_decode == "chroma_guided_band":
             if chroma_a is None or chroma_b is None:
@@ -269,7 +300,7 @@ def evaluate_pairwise_methods(
                 pooled_b,
                 lower_bounds=lower,
                 upper_bounds=upper,
-                distance="sqeuclidean",
+                distance=deep_distance,
             )
             runtime_d += coarse_runtime
         elif resolved_deep_decode in {"deepalign_transcription_fused", "deepalign_transcription_fused_refined"}:
@@ -300,7 +331,7 @@ def evaluate_pairwise_methods(
                 fusion_chroma_weight=fusion_chroma_weight,
             )
             refinement_features = (fused_a, fused_b)
-            path_d, _, runtime_d = fast_dtw_align(fused_a, fused_b, distance="sqeuclidean")
+            path_d, _, runtime_d = fast_dtw_align(fused_a, fused_b, distance=deep_distance)
         elif resolved_deep_decode == "deepalign_transcription_guided":
             fused_a = _build_transcription_fused_features(
                 audio=audio_a,
@@ -344,7 +375,7 @@ def evaluate_pairwise_methods(
                 frame_hop=deep_hop * pool_size,
                 transcription_cache_root=transcription_cache_root,
             )
-            coarse_path, _, coarse_runtime = fast_dtw_align(coarse_a, coarse_b, distance="sqeuclidean")
+            coarse_path, _, coarse_runtime = fast_dtw_align(coarse_a, coarse_b, distance=deep_distance)
             frame_duration_d = (deep_hop * pool_size) / sr
             resolved_band = (
                 band_radius_frames
@@ -365,11 +396,11 @@ def evaluate_pairwise_methods(
                     fused_b,
                     lower_bounds=lower,
                     upper_bounds=upper,
-                    distance="sqeuclidean",
+                    distance=deep_distance,
                 )
                 runtime_d += coarse_runtime
             except ValueError:
-                path_d, _, runtime_d = fast_dtw_align(fused_a, fused_b, distance="sqeuclidean")
+                path_d, _, runtime_d = fast_dtw_align(fused_a, fused_b, distance=deep_distance)
                 runtime_d += coarse_runtime
         else:
             frame_duration_d = (deep_hop * pool_size) / sr
@@ -446,6 +477,15 @@ def evaluate_pairwise_methods(
                 extra_fields={
                     "deep_decode": resolved_deep_decode,
                     "band_radius_frames": float(band_radius_frames) if band_radius_frames is not None else np.nan,
+                    "pool_size": float(pool_size),
+                    "deep_distance": deep_distance,
+                    "fusion_deep_weight": float(fusion_deep_weight),
+                    "fusion_onset_weight": float(fusion_onset_weight),
+                    "fusion_note_weight": float(fusion_note_weight),
+                    "fusion_dlnco_weight": float(fusion_dlnco_weight),
+                    "fusion_chroma_weight": float(fusion_chroma_weight),
+                    "refine_window_sec": float(refine_window_sec),
+                    "score_refine_radius_sec": float(score_refine_radius_sec),
                 },
             )
         )
@@ -592,6 +632,7 @@ def merge_evaluation_results(
         "piece_a_id",
         "piece_b_id",
         "method",
+        *DEEP_VARIANT_COLUMNS,
     ),
 ) -> pd.DataFrame:
     """Merge one or more evaluation CSVs into a single de-duplicated table."""
@@ -605,6 +646,9 @@ def merge_evaluation_results(
         if frame.empty:
             continue
         frame = frame.copy()
+        for column in DEEP_VARIANT_COLUMNS:
+            if column not in frame.columns:
+                frame[column] = np.nan
         frame["_source_path"] = str(path)
         frames.append(frame)
 
@@ -624,7 +668,7 @@ def merge_evaluation_results(
 
     sort_columns = [
         column
-        for column in ("dataset", "group_id", "pair_id", "method", "piece_a_id", "piece_b_id")
+        for column in ("dataset", "group_id", "pair_id", "method", "deep_decode", "piece_a_id", "piece_b_id")
         if column in merged.columns
     ]
     if sort_columns:
@@ -639,7 +683,9 @@ def summarize_evaluation(results: pd.DataFrame) -> dict[str, dict[str, float]]:
     if results.empty:
         return summary
 
-    for method, method_frame in results.groupby("method"):
+    labelled = add_method_variant_column(results)
+    method_col = METHOD_VARIANT_COLUMN if METHOD_VARIANT_COLUMN in labelled.columns else "method"
+    for method, method_frame in labelled.groupby(method_col):
         summary[method] = {
             "pairs": float(len(method_frame)),
             "mae_ms": float(method_frame["mae"].mean() * 1000),
@@ -655,9 +701,39 @@ def summarize_evaluation(results: pd.DataFrame) -> dict[str, dict[str, float]]:
 def check_success_criteria(
     results: pd.DataFrame,
     candidate_method: str = "deepalign",
+    candidate_deep_decode: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate the dissertation success criteria against one candidate method."""
     candidate_rows = results[results["method"] == candidate_method]
+    if candidate_deep_decode is not None:
+        if "deep_decode" not in candidate_rows.columns:
+            candidate_rows = candidate_rows.iloc[0:0]
+        else:
+            requested_decode = _normalize_variant_value(candidate_deep_decode)
+            candidate_rows = candidate_rows[
+                candidate_rows["deep_decode"].map(_normalize_variant_value) == requested_decode
+            ]
+
+    if candidate_deep_decode is None and candidate_method == "deepalign" and _needs_method_variant_labels(results):
+        variants = sorted(
+            {
+                _normalize_variant_value(value)
+                for value in results.loc[results["method"].astype(str).eq(candidate_method), "deep_decode"]
+                if _normalize_variant_value(value)
+            }
+        )
+        return {
+            "available": False,
+            "criterion_1_pass": False,
+            "criterion_2_mae_pass": False,
+            "criterion_2_ar_pass": False,
+            "candidate_method": candidate_method,
+            "error": (
+                "Multiple DeepAlign variants are present; choose one with "
+                "`candidate_deep_decode`. Available variants: " + ", ".join(variants)
+            ),
+        }
+
     if candidate_rows.empty:
         return {
             "available": False,
@@ -678,6 +754,30 @@ def check_success_criteria(
         "criterion_2_mae_pass": mae < 0.02,
         "criterion_2_ar_pass": ar_50 > 0.98,
     }
+
+
+def _needs_method_variant_labels(results: pd.DataFrame) -> bool:
+    if results.empty or "method" not in results.columns or "deep_decode" not in results.columns:
+        return False
+    deep_rows = results[results["method"].astype(str).eq("deepalign")]
+    if deep_rows.empty:
+        return False
+    variants = {_normalize_variant_value(value) for value in deep_rows["deep_decode"]}
+    variants.discard("")
+    has_unlabelled_deep_rows = any(_normalize_variant_value(value) == "" for value in deep_rows["deep_decode"])
+    return len(variants) > 1 or (bool(variants) and has_unlabelled_deep_rows)
+
+
+def _normalize_variant_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"", "nan", "none"} else text
 
 
 def _build_result_row(

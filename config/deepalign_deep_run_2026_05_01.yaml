@@ -1,25 +1,25 @@
-# DeepAlign-26 training configuration
+# Deep GPU continuation run for May 1, 2026.
+#
+# Purpose: push beyond the current Stage-1 checkpoint with a longer AR-first
+# local-precision run, then evaluate with transcription-fused decoding.
 
-# Dataset and sampling
 dataset:
-  swd_path: null  # Set to the extracted SWD root
-  max_length_sec: 30.0
+  swd_path: data
+  max_length_sec: 15.0
   segment_sampling: aligned_measures
-  samples_per_epoch: null  # null = max(256, len(train_pairs) * 16)
-  cache_spectrograms: false
+  samples_per_epoch: 256
+  cache_spectrograms: true
   cache_root: .cache/cqt
   debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
   val_split: 0.2
-  performances: null  # null = use all available
+  performances: null
 
-# Audio front-end
 audio:
   sr: 22050
-  hop_length: 220  # ~10ms at 22050 Hz (as per initial plan)
-  n_bins: 84       # 7 octaves x 12 bins
+  hop_length: 220
+  n_bins: 84
   bins_per_octave: 12
 
-# Model architecture
 model:
   embed_dim: 64
   conv_channels: [32, 64, 128, 128]
@@ -28,37 +28,33 @@ model:
   dropout: 0.1
   temporal_attention_heads: 0
 
-# Optimisation
 training:
-  epochs: 50
+  epochs: 30
   batch_size: 4
-  lr: 0.001
+  lr: 0.0003
   weight_decay: 0.0001
   gradient_clip: 1.0
-  resume_from: null
+  resume_from: checkpoints/cycle1_stage1_local_precision_2026_04_19/best_model.pt
   selection_metric: debug_ar50
   anchor_loss_weight: 0.0
   anchor_temperature: 0.1
   anchor_min_anchor_gap: 1
 
-# Soft-DTW objective
 soft_dtw:
-  start_gamma: 1.0
+  start_gamma: 0.3
   end_gamma: 0.01
   normalize: true
   dist_func: sqeuclidean
 
-# Waveform augmentation
 augmentation:
-  enabled: true
+  enabled: false
   time_stretch_range: [0.8, 1.2]
   pitch_shift_range: [-2, 2]
   noise_snr_range: [20.0, 40.0]
-  augment_prob: 0.5
+  augment_prob: 0.0
 
-# DeepAlign evaluation and debug-gate decoding
 evaluation:
-  deep_decode: unconstrained
+  deep_decode: deepalign_transcription_fused
   deep_distance: sqeuclidean
   band_radius_frames: null
   transcription_cache_root: .cache/transcription/basic_pitch
@@ -70,7 +66,6 @@ evaluation:
   refine_window_sec: 8.0
   score_refine_radius_sec: 0.5
 
-# Output artefacts
 output:
-  checkpoint_dir: checkpoints
+  checkpoint_dir: checkpoints/deep_run_ar_fused_2026_05_01
   save_every_n_epochs: 1

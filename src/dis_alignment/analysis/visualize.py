@@ -9,6 +9,8 @@ import pandas as pd
 import seaborn as sns
 from numpy.typing import NDArray
 
+from dis_alignment.evaluation import add_method_variant_column
+
 # Set publication-quality defaults
 plt.rcParams.update({
     "font.family": "serif",
@@ -46,8 +48,9 @@ def plot_error_vs_length(
     Returns:
         Matplotlib Figure object.
     """
+    results = add_method_variant_column(results)
     fig, ax = plt.subplots(figsize=figsize)
-    
+
     method_col = _method_column(results)
     algorithms = results[method_col].unique()
     palette = sns.color_palette("husl", len(algorithms))
@@ -106,8 +109,9 @@ def plot_runtime_comparison(
     Returns:
         Matplotlib Figure object.
     """
+    results = add_method_variant_column(results)
     fig, ax = plt.subplots(figsize=figsize)
-    
+
     method_col = _method_column(results)
     algorithms = results[method_col].unique()
     palette = sns.color_palette("husl", len(algorithms))
@@ -299,6 +303,7 @@ def plot_metric_boxplot(
     Returns:
         Matplotlib Figure object.
     """
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     fig, ax = plt.subplots(figsize=figsize)
     
@@ -306,7 +311,9 @@ def plot_metric_boxplot(
         data=results,
         x=method_col,
         y=metric,
+        hue=method_col,
         palette="husl",
+        legend=False,
         ax=ax,
     )
     
@@ -330,6 +337,7 @@ def plot_error_histogram(
     figsize: tuple[float, float] = (8, 5),
 ) -> plt.Figure:
     """Plot per-method error distributions."""
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -360,6 +368,7 @@ def plot_success_criteria_summary(
     figsize: tuple[float, float] = (8, 5),
 ) -> plt.Figure:
     """Visualize the dissertation success criteria by method."""
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     summary = results.groupby(method_col).agg(
         mae_ms=("mae", lambda series: float(series.mean() * 1000)),
@@ -368,7 +377,7 @@ def plot_success_criteria_summary(
     summary = summary.reset_index()
 
     fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=False)
-    sns.barplot(data=summary, x=method_col, y="mae_ms", palette="husl", ax=axes[0])
+    sns.barplot(data=summary, x=method_col, y="mae_ms", hue=method_col, palette="husl", legend=False, ax=axes[0])
     axes[0].axhline(50.0, linestyle="--", color="black", linewidth=1, label="50 ms")
     axes[0].axhline(20.0, linestyle=":", color="black", linewidth=1, label="20 ms")
     axes[0].set_title("Mean MAE")
@@ -376,7 +385,7 @@ def plot_success_criteria_summary(
     axes[0].tick_params(axis="x", rotation=45)
     axes[0].legend(loc="upper right")
 
-    sns.barplot(data=summary, x=method_col, y="ar_50ms_pct", palette="husl", ax=axes[1])
+    sns.barplot(data=summary, x=method_col, y="ar_50ms_pct", hue=method_col, palette="husl", legend=False, ax=axes[1])
     axes[1].axhline(98.0, linestyle="--", color="black", linewidth=1, label="98%")
     axes[1].set_title("AR@50ms")
     axes[1].set_ylabel("Percent")
@@ -403,6 +412,7 @@ def create_summary_table(
     Returns:
         Summary DataFrame.
     """
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     summary = results.groupby(method_col).agg({
         "mae": ["mean", "std", "median"],
@@ -430,6 +440,7 @@ def create_success_criteria_table(
     output_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """Create a compact success-criteria summary table."""
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     summary = results.groupby(method_col).agg(
         mae_ms=("mae", lambda series: float(series.mean() * 1000)),
@@ -450,6 +461,8 @@ def create_success_criteria_table(
 
 
 def _method_column(results: pd.DataFrame) -> str:
+    if "method_variant" in results.columns:
+        return "method_variant"
     if "algorithm" in results.columns:
         return "algorithm"
     if "method" in results.columns:

@@ -1,60 +1,58 @@
 # Project Status & TODOs
 
-Tracking progress for the DeepAlign-26 project (Differentiable DTW + Deep Learning for audio alignment).
+Tracking progress for the DeepAlign-26 project.
 
-**Current Date:** March 29, 2026  
-**Current Week:** 8 of 12
+**Current Date:** April 27, 2026
+**Current Week:** 13 from the February 2, 2026 project start
+
+## Current Best Evidence
+
+- Best SWD result: `results/swd_evaluation_transcription_fused_2026_04_25.csv`
+- Current figure/table bundle: `figures/swd_current_best_2026_04_27`
+- Promoted method for write-up: `deepalign` with `deep_decode=deepalign_transcription_fused`
+- Full SWD metrics: `MAE 367.0 ms`, `median AE 165.0 ms`, `AR@50ms 41.5%`
+- Statistical result: paired MAE comparison against recorded `chroma_dtw` baseline shows `92.6%` mean improvement, Wilcoxon `p=0.0005`
+- Important limitation: the original stretch target (`MAE < 50 ms`, `AR@50ms > 98%`) is not met.
 
 ## Completed
 
-### Foundations and Core Model
-- [x] Python 3.12 results environment documented and validated
-- [x] SWD downloader and verifier
-- [x] SWD data loader with pairing and measure-annotation logic
-- [x] Feature extraction: CQT chroma and DLNCO
-- [x] Baseline alignment algorithms: Global DTW and MrMsDTW wrapper
-- [x] DeepAlign encoder, Soft-DTW loss, augmentation, training loop, inference
-- [x] Dry-run training validation path
-- [x] Unit tests for features, alignment, model, and public project surface
+### Core System
 
-### Results Workflow Implementation
-- [x] Unified SWD evaluator with `--methods`
-- [x] Matchmaker adapter scaffold for score-following baselines
-- [x] MazurkaBL-style dataset loader and evaluator
-- [x] Shared result CSV schema across SWD and Mazurka evaluation paths
-- [x] CLI commands: `evaluate-swd`, `evaluate-mazurka`, `visualize`, `analyze`
-- [x] Friedman / Nemenyi omnibus statistics
-- [x] Figure generation for boxplots, histograms, runtime scaling, and success criteria
-- [x] Reproducibility instructions and updated README
+- [x] Python 3.12 results environment validated
+- [x] SWD dataset present locally under `data/`
+- [x] SWD loader with shared measure annotation logic
+- [x] DeepAlign encoder, Soft-DTW training, aligned-window recovery training, checkpointing, and inference
+- [x] Cached CQT support for faster experiments
+- [x] SWD evaluation with `chroma_dtw`, `mrmsdtw`, `deepalign`, and `matchmaker`
+- [x] Basic Pitch transcription feature cache and transcription-fused DeepAlign decoding
+- [x] MazurkaBL-style loader/evaluator implementation
+- [x] Figure generation, success tables, Friedman/Nemenyi statistics, and pairwise statistics
+- [x] Variant-aware result merging and reporting for multiple DeepAlign decoding modes
 
 ### Validation
-- [x] `python -m dis_alignment.cli --help`
-- [x] `python -m dis_alignment.model.train --dry-run`
-- [x] `python -m pytest -q`
-- [x] Real SWD `chroma_dtw` smoke evaluation over 24 pairs
+
+- [x] `.venv312\Scripts\python.exe -m dis_alignment.cli --help`
+- [x] `.venv312\Scripts\python.exe -m pytest -q`
+- [x] Current full test suite: `79 passed`
+- [x] Current SWD figures regenerated from the promoted evidence CSV
 
 ## Remaining Work
 
-### Environment and External Baselines
-- [ ] Install and validate Synctoolbox in a usable Python 3.12 baseline environment or keep it in a separate mergeable results env
-- [ ] Install and validate official Matchmaker dependencies (PortAudio, FluidSynth, build tools)
-- [ ] Confirm SWD score-following baseline runs end-to-end with real data
+### Dissertation Evidence
 
-### SWD Results
-- [ ] Download / verify the SWD dataset locally
-- [ ] Train the final DeepAlign checkpoint on SWD
-- [ ] Tune the Soft-DTW gamma annealing schedule on real SWD runs
-- [ ] Run SWD comparison with `chroma_dtw`, `mrmsdtw`, `deepalign`, and `matchmaker`
-- [ ] Verify Success Criterion 1: MAE < 50 ms
-- [ ] Verify Success Criterion 2: MAE < 20 ms and AR@50ms > 98%
+- [ ] Decide whether `deepalign_transcription_fused` is final, or run one last clearly bounded full-SWD improvement attempt.
+- [ ] If final, do not keep tuning; write the dissertation around the recovered/improved method and its failure analysis.
+- [ ] Archive the final CSVs, figures, checkpoint, config, and logs outside git because `results/`, `figures/`, `checkpoints/`, and `.cache/` are ignored.
+- [ ] Record exact environment caveats: Basic Pitch is used through the ONNX path, and `synctoolbox` has dependency conflicts in the combined Python 3.12 environment.
 
-### Mazurka Robustness
-- [ ] Prepare a MazurkaBL-style checkout with metadata, annotations, and score files
-- [ ] Run Mazurka robustness evaluation with the same method set
-- [ ] Inspect rubato-heavy failure cases and representative alignments
+### Robustness
 
-### Dissertation Outputs
-- [ ] Generate final SWD and Mazurka CSVs
-- [ ] Generate final figure directories from those CSVs
-- [ ] Write up the final technical report around the produced results
-- [ ] Package trained weights and final reproducibility bundle
+- [ ] Run Mazurka evaluation only if suitable audio/annotation data is available.
+- [ ] If Mazurka is not available in time, state it as planned robustness work rather than making unsupported claims.
+
+### Write-Up
+
+- [ ] Present the project as pairwise audio-to-audio alignment for performances of the same piece.
+- [ ] Explain the novel contribution as the DeepAlign recovery path plus transcription-fused learned-feature decoding, not as a completely new SOTA method.
+- [ ] Report that the system improves strongly over the recorded baselines but does not reach the original aspirational threshold.
+- [ ] Include representative failure cases and explain why strict 50 ms alignment remains hard.

@@ -1,6 +1,7 @@
 """Evaluation utilities for DeepAlign experiments and legacy baselines."""
 
 from dis_alignment.evaluation.common import (
+    add_method_variant_column,
     check_success_criteria,
     merge_evaluation_results,
     parse_methods,
@@ -20,6 +21,7 @@ from dis_alignment.evaluation.swd import (
 
 __all__ = [
     "alignment_rate",
+    "add_method_variant_column",
     "check_success_criteria",
     "coverage",
     "evaluate_mazurka_dataset",

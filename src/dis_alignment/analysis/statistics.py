@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from dis_alignment.evaluation import add_method_variant_column
+
 
 def summarize_results(
     results: pd.DataFrame,
@@ -23,6 +25,7 @@ def summarize_results(
     Returns:
         Summary DataFrame with mean, std, min, max for key metrics.
     """
+    results = add_method_variant_column(results)
     method_col = group_by or _method_column(results)
     metrics = [
         column
@@ -48,6 +51,7 @@ def failure_analysis(
     Returns:
         Dict containing failure statistics and analysis.
     """
+    results = add_method_variant_column(results)
     failures = results[(results["mae"] > mae_threshold) | (results["ar_50ms"] < ar_threshold)]
     successes = results[(results["mae"] <= mae_threshold) & (results["ar_50ms"] >= ar_threshold)]
 
@@ -68,6 +72,7 @@ def failure_analysis(
         )
 
     id_col = _id_column(results)
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     analysis["worst_pieces"] = failures.nlargest(10, "mae")[
         [id_col, method_col, "mae", "ar_50ms", "duration_s"]
@@ -87,6 +92,7 @@ def compute_significance(
 
     Uses the Wilcoxon signed-rank test for paired comparisons.
     """
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     id_col = _id_column(results)
 
@@ -138,6 +144,7 @@ def friedman_nemenyi_analysis(
 
     Returns a dict that is friendly to CLI/JSON style output.
     """
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
     id_col = _id_column(results)
     pivot = results.pivot_table(index=id_col, columns=method_col, values=metric, aggfunc="mean")
@@ -202,6 +209,7 @@ def friedman_nemenyi_analysis(
 def runtime_efficiency_analysis(results: pd.DataFrame) -> dict[str, Any]:
     """Analyze runtime efficiency and scaling behavior."""
     analysis = {}
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
 
     for algo in results[method_col].unique():
@@ -229,6 +237,7 @@ def runtime_efficiency_analysis(results: pd.DataFrame) -> dict[str, Any]:
 def memory_analysis(results: pd.DataFrame) -> dict[str, Any]:
     """Analyze memory usage patterns."""
     analysis = {}
+    results = add_method_variant_column(results)
     method_col = _method_column(results)
 
     for algo in results[method_col].unique():
@@ -275,6 +284,8 @@ def _smaller_is_better(metric: str) -> bool:
 
 
 def _method_column(results: pd.DataFrame) -> str:
+    if "method_variant" in results.columns:
+        return "method_variant"
     if "algorithm" in results.columns:
         return "algorithm"
     if "method" in results.columns:

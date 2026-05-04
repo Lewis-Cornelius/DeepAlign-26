@@ -117,6 +117,12 @@ deepalign merge-results \
   -o results/swd_evaluation.csv
 ```
 
+`merge-results`, `visualize`, and `analyze` are DeepAlign-variant aware. Raw rows keep
+`method=deepalign` and record the decoding variant in `deep_decode`; when a CSV contains
+more than one DeepAlign variant, reporting labels such as
+`deepalign:deepalign_transcription_fused` are created automatically so variants are not
+deduplicated or averaged together by accident.
+
 ## Evaluation Outputs
 
 The SWD and Mazurka evaluation commands write a consistent row schema, including:
@@ -137,12 +143,30 @@ The SWD and Mazurka evaluation commands write a consistent row schema, including
 - `runtime_s`
 - `n_gt_points`
 - `deep_decode`
+- `pool_size`
+- `deep_distance`
+- fusion/refinement settings for DeepAlign transcription variants
 
 The default success criteria checked by the CLI target the `deepalign` method:
 
 - `MAE < 50 ms`
 - `MAE < 20 ms`
 - `AR@50ms > 98%`
+
+## Current Best SWD Evidence
+
+As of 2026-04-27, the strongest SWD result in this checkout is:
+
+- Results CSV: `results/swd_evaluation_transcription_fused_2026_04_25.csv`
+- Figure/table directory: `figures/swd_current_best_2026_04_27`
+- Method promoted for write-up: `deepalign` with `deep_decode=deepalign_transcription_fused`
+- Mean MAE: `367.0 ms`
+- Median absolute error: `165.0 ms`
+- AR@50ms: `41.5%`
+- Pairwise MAE improvement over the recorded `chroma_dtw` baseline: `92.6%`
+
+This does not meet the aspirational success thresholds above, but it is the current
+best evidence package and is the result to use unless a later full-SWD run beats it.
 
 ## Commands
 
@@ -237,11 +261,10 @@ dis-alignment/
 
 ## Reproducibility Notes
 
-- No datasets, checkpoints, figures, or result CSVs are committed in this checkout.
-- The code path is implemented and validated with:
-  - `python -m dis_alignment.cli --help`
-  - `python -m dis_alignment.model.train --dry-run`
-  - `python -m pytest -q`
+- Datasets, checkpoints, figures, result CSVs, logs, and caches are treated as local artifacts and are not committed.
+- The code path is implemented and validated in the Python 3.12 environment with:
+  - `.venv312\Scripts\python.exe -m dis_alignment.cli --help`
+  - `.venv312\Scripts\python.exe -m pytest -q`
 - See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for environment and run instructions.
 
 ## References
