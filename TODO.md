@@ -2,7 +2,7 @@
 
 Tracking progress for the DeepAlign-26 project.
 
-**Current Date:** April 27, 2026
+**Current Date:** May 11, 2026
 **Current Week:** 13 from the February 2, 2026 project start
 
 ## Current Best Evidence
@@ -12,7 +12,7 @@ Tracking progress for the DeepAlign-26 project.
 - Promoted method for write-up: `deepalign` with `deep_decode=deepalign_transcription_fused`
 - Full SWD metrics: `MAE 367.0 ms`, `median AE 165.0 ms`, `AR@50ms 41.5%`
 - Statistical result: paired MAE comparison against recorded `chroma_dtw` baseline shows `92.6%` mean improvement, Wilcoxon `p=0.0005`
-- Important limitation: the original stretch target (`MAE < 50 ms`, `AR@50ms > 98%`) is not met.
+- Important limitation: the original stretch target (`MAE < 20 ms`, `AR@50ms > 98%`) is not met.
 
 ## Completed
 
@@ -33,7 +33,7 @@ Tracking progress for the DeepAlign-26 project.
 
 - [x] `.venv312\Scripts\python.exe -m dis_alignment.cli --help`
 - [x] `.venv312\Scripts\python.exe -m pytest -q`
-- [x] Current full test suite: `79 passed`
+- [x] Current full test suite: `138 passed`
 - [x] Current SWD figures regenerated from the promoted evidence CSV
 
 ## Remaining Work
@@ -41,6 +41,7 @@ Tracking progress for the DeepAlign-26 project.
 ### Dissertation Evidence
 
 - [ ] Decide whether `deepalign_transcription_fused` is final, or run one last clearly bounded full-SWD improvement attempt.
+- [ ] If attempting the original target, use `scripts/run_initial_plan_supervised_20ms_sprint.ps1`, not the strict self-supervised ablation route.
 - [ ] If final, do not keep tuning; write the dissertation around the recovered/improved method and its failure analysis.
 - [ ] Archive the final CSVs, figures, checkpoint, config, and logs outside git because `results/`, `figures/`, `checkpoints/`, and `.cache/` are ignored.
 - [ ] Record exact environment caveats: Basic Pitch is used through the ONNX path, and `synctoolbox` has dependency conflicts in the combined Python 3.12 environment.

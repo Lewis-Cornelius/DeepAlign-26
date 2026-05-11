@@ -208,31 +208,51 @@ Supported `--deep-decode` values for `deepalign`:
 The transcription decode modes cache Basic Pitch note/onset/contour outputs under `.cache/transcription/basic_pitch` by default. They keep the CSV method as `deepalign` and record the variant in `deep_decode`, so dissertation tables can treat them as DeepAlign variants rather than external baselines.
 The refined/score-guided modes are experimental research variants; promote them only when a gate run beats `deepalign_transcription_fused` on full-SWD `AR@50ms`.
 
-### Initial-Claim Audio-Only Sprint
+### Original-Plan Supervised 20 ms Route
 
-The strict headline route is now `scripts/run_initial_claim_strict_audio_only_sprint.ps1`.
-It uses SWD audio only for training and keeps the final evaluation as learned-feature
-DeepAlign with unconstrained DTW:
+The original dissertation plan was not a strict self-supervised audio-only
+sprint. It allowed SWD annotation/score-derived timing artifacts to create weak
+or dense alignment targets, then trained a learned DeepAlign encoder with
+Soft-DTW and local timing supervision. The current implementation for that route
+is:
 
-- Stage 1: `config/deepalign_initial_claim_strict_ssl_stage1.yaml` for same-audio
-  multi-view pretraining
-- Stage 2: `config/deepalign_initial_claim_strict_pair_stage2.yaml` for same-lied
-  cross-performance training with in-batch negatives
-- Stage 3: `config/deepalign_initial_claim_strict_selfmine_stage3.yaml` for optional
-  learned self-mined path refinement after Stage 2 passes its gate
-- final gates use `deepalign` with `deep_decode=unconstrained`, `--pool-size 1`,
-  and no skipped pairs
+- `scripts/run_initial_plan_supervised_20ms_sprint.ps1`
+- `config/deepalign_initial_plan_supervised_20ms.yaml`
 
-Run the complete gate sequence with:
+This route generates anchor-calibrated teacher paths for training, trains with
+`teacher_path` crops, `PathDistillationLoss`, dense anchor supervision, anti-
+collapse regularization, and a positive Soft-DTW weight. Final inference remains
+learned DeepAlign features with unconstrained DTW at `--deep-hop 110` and
+`--pool-size 1`.
+
+Run the full target attempt with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_initial_plan_supervised_20ms_sprint.ps1 -Mode All -SwdPath data -Device cuda
+```
+
+The target gate for this route is full SWD `MAE < 20 ms` and `AR@50ms > 98%`,
+with all 24 pairs present. If teacher generation or DeepAlign evaluation fails
+that gate, the correct outcome is an honest failed target run, not a weakened
+threshold.
+
+### Strict Audio-Only Ablation
+
+`scripts/run_initial_claim_strict_audio_only_sprint.ps1` is now an ablation and
+claim-boundary stress test. It uses SWD audio only for training, forbids teacher
+paths, anchors, score, transcription, guided bands, and non-`pool_size=1`
+evaluation, and should not be presented as the original supervised Soft-DTW
+target route.
+
+Run the strict ablation sequence with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_initial_claim_strict_audio_only_sprint.ps1 -Mode All -SwdPath data -Device cuda
 ```
 
-The hard headline gate is full SWD `MAE < 20 ms` and `AR@50ms > 98%`, with all
-24 pairs present. Teacher, pseudo-teacher, score-guided, transcription-guided,
-anchor-calibrated, chroma-guided, diagonal-band, and non-`pool_size=1` runs are
-diagnostic only for this claim.
+Its final gate is also full SWD `MAE < 20 ms` and `AR@50ms > 98%`, with all 24
+pairs present. It is expected to be harder than the original-plan supervised
+route because it removes the timing supervision that the plan relied on.
 
 ### Diagnostic Teacher Tracks
 

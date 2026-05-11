@@ -157,3 +157,39 @@ def test_scripts_do_not_use_hardcoded_personal_paths():
         contents = script_path.read_text(encoding="utf-8")
         assert "c:/code/Dis" not in contents
         assert "C:\\code\\Dis" not in contents
+
+
+def test_original_plan_supervised_route_keeps_20ms_target():
+    from dis_alignment.model.train import _load_training_config
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = _load_training_config(repo_root / "config" / "deepalign_initial_plan_supervised_20ms.yaml")
+    training = config["training"]
+    soft_dtw = config["soft_dtw"]
+    evaluation = config["evaluation"]
+
+    assert config["dataset"]["segment_sampling"] == "teacher_path"
+    assert training["teacher_path_root"] == "results/teacher_target_20ms/paths"
+    assert training["selection_metric"] == "debug_balanced"
+    assert training["track_debug_checkpoints"] is True
+    assert training["path_distill_loss_weight"] > 0.0
+    assert training["dense_anchor_loss_weight"] > 0.0
+    assert soft_dtw["loss_weight"] > 0.0
+    assert evaluation["deep_decode"] == "unconstrained"
+    assert evaluation["pool_size"] == 1
+    assert evaluation["alignment_eval_every_n_epochs"] == 1
+
+    runner = (repo_root / "scripts" / "run_initial_plan_supervised_20ms_sprint.ps1").read_text(encoding="utf-8")
+    assert "MaxMaeMs 20" in runner
+    assert "MinAr50Pct 98" in runner
+    assert "--deep-hop\", \"110\"" in runner
+    assert "--pool-size\", \"1\"" in runner
+
+
+def test_strict_ablation_runner_does_not_weaken_final_gate():
+    repo_root = Path(__file__).resolve().parents[1]
+    runner = (repo_root / "scripts" / "run_initial_claim_strict_audio_only_sprint.ps1").read_text(encoding="utf-8")
+
+    assert "Gate 4 threshold: <20 ms and >98% AR@50" in runner
+    assert "MaxMaeMs 20" in runner
+    assert "MaxMaeMs 59" not in runner

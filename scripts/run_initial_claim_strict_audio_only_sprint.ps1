@@ -145,7 +145,7 @@ function Invoke-Stage3 {
 function Invoke-Full {
     $Csv = Join-Path $ResultsDir "full_24_pair_strict.csv"
     Invoke-StrictEval -Label "Gate 4: full 24-pair strict eval" -Checkpoint $Stage3Checkpoint -Output $Csv
-    Invoke-ResultGate -Label "Gate 4 threshold: <59 ms and >98% AR@50" -CsvPath $Csv -MaxMaeMs 59 -MinAr50Pct 98 -ExpectedPairs 24
+    Invoke-ResultGate -Label "Gate 4 threshold: <20 ms and >98% AR@50" -CsvPath $Csv -MaxMaeMs 20 -MinAr50Pct 98 -ExpectedPairs 24
 }
 
 function Invoke-Smoke {
