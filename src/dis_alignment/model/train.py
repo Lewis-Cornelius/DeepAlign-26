@@ -19,7 +19,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from dis_alignment.model.anchor_loss import (
     AnchorContrastiveLoss,
+    CycleAlignmentLoss,
     EmbeddingAntiCollapseLoss,
+    HardNegativeContrastiveLoss,
+    MaskedReconstructionLoss,
     PathDistillationLoss,
     SequenceContrastiveLoss,
 )
@@ -64,13 +67,49 @@ class _SyntheticPairDataset(Dataset):
         return self.n_pairs
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
+        spec_a = torch.randn(1, self.n_freq, self.n_time)
+        spec_b = spec_a.clone()
+        mask = torch.zeros_like(spec_a)
+        mask[:, :, self.n_time // 2 :: max(1, self.n_time // 8)] = 1.0
+        spec_masked = spec_a.masked_fill(mask.bool(), 0.0)
         return {
-            "spec_a": torch.randn(1, self.n_freq, self.n_time),
-            "spec_b": torch.randn(1, self.n_freq, self.n_time),
+            "spec_a": spec_masked,
+            "spec_b": spec_b,
+            "spec_neg": torch.randn(1, self.n_freq, self.n_time),
             "pair_id": f"synthetic_{idx}",
+            "lied_id": f"synthetic_lied_{idx % 2}",
             "anchor_frame_indices_a": [],
             "anchor_frame_indices_b": [],
+            "teacher_frame_indices_a": list(range(0, self.n_time, max(1, self.n_time // 8))),
+            "teacher_frame_indices_b": list(range(0, self.n_time, max(1, self.n_time // 8))),
+            "temporal_order_label": idx % 3,
+            "relative_offset_label": idx % 5,
+            "reconstruction_target_a": spec_a,
+            "reconstruction_mask_a": mask,
         }
+
+
+class _StrictAuxiliaryHeads(nn.Module):
+    """Training-only heads for strict Stage 1 v2 objectives."""
+
+    def __init__(self, *, embed_dim: int, n_freq_bins: int, relative_offset_classes: int):
+        super().__init__()
+        pair_dim = embed_dim * 4
+        hidden = max(embed_dim, 32)
+        self.temporal_order = nn.Sequential(
+            nn.Linear(pair_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 3),
+        )
+        self.relative_offset = nn.Sequential(
+            nn.Linear(pair_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, max(1, int(relative_offset_classes))),
+        )
+        self.reconstruction = nn.Linear(embed_dim, n_freq_bins)
+
+    def pair_features(self, emb_a: torch.Tensor, emb_b: torch.Tensor) -> torch.Tensor:
+        return torch.cat([emb_a, emb_b, (emb_a - emb_b).abs(), emb_a * emb_b], dim=-1)
 
 
 def train(
@@ -116,6 +155,17 @@ def train(
     sequence_contrastive_loss_weight: float = 0.0,
     anti_collapse_loss_weight: float = 0.0,
     anti_collapse_covariance_weight: float = 0.01,
+    temporal_order_loss_weight: float = 0.0,
+    relative_offset_loss_weight: float = 0.0,
+    relative_offset_bins: Sequence[int] | None = None,
+    masked_reconstruction_loss_weight: float = 0.0,
+    cycle_consistency_loss_weight: float = 0.0,
+    cycle_entropy_loss_weight: float = 0.0,
+    cycle_monotonicity_loss_weight: float = 0.0,
+    cycle_smoothness_loss_weight: float = 0.0,
+    hard_negative_loss_weight: float = 0.0,
+    hard_negative_radius_frames: int = 96,
+    memory_bank_size: int = 0,
     teacher_path_root: str | None = None,
     self_mined_path_root: str | None = None,
     num_anchor_samples: int = 64,
@@ -153,6 +203,7 @@ def train(
     out.mkdir(parents=True, exist_ok=True)
     resolved_cache_root = str(Path(cache_root or ".cache/cqt").resolve()) if cache_spectrograms else None
     debug_lied_ids = normalize_debug_lied_ids(debug_subset_lieder)
+    resolved_relative_offset_bins = tuple(sorted(int(value) for value in (relative_offset_bins or (8, 24, 64, 128))))
     augmentor_kwargs = augmentor_kwargs or {}
     supervised_anchor_training = (
         anchor_loss_weight > 0
@@ -227,6 +278,8 @@ def train(
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
+            relative_offset_bins=list(resolved_relative_offset_bins),
+            hard_negative_radius_frames=hard_negative_radius_frames,
         )
         val_dataset = SWDPairDataset(
             swd,
@@ -245,6 +298,8 @@ def train(
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
+            relative_offset_bins=list(resolved_relative_offset_bins),
+            hard_negative_radius_frames=hard_negative_radius_frames,
         )
         n_train = len(train_pairs)
         n_val = len(val_pairs)
@@ -322,6 +377,40 @@ def train(
         if anti_collapse_loss_weight > 0
         else None
     )
+    hard_negative_loss_fn = (
+        HardNegativeContrastiveLoss().to(dev)
+        if hard_negative_loss_weight > 0
+        else None
+    )
+    reconstruction_loss_fn = (
+        MaskedReconstructionLoss().to(dev)
+        if masked_reconstruction_loss_weight > 0
+        else None
+    )
+    cycle_loss_fn = (
+        CycleAlignmentLoss(temperature=anchor_temperature).to(dev)
+        if (
+            cycle_consistency_loss_weight > 0
+            or cycle_entropy_loss_weight > 0
+            or cycle_monotonicity_loss_weight > 0
+            or cycle_smoothness_loss_weight > 0
+        )
+        else None
+    )
+    use_auxiliary_heads = (
+        temporal_order_loss_weight > 0
+        or relative_offset_loss_weight > 0
+        or masked_reconstruction_loss_weight > 0
+    )
+    auxiliary_heads = (
+        _StrictAuxiliaryHeads(
+            embed_dim=embed_dim,
+            n_freq_bins=n_freq_bins,
+            relative_offset_classes=len(resolved_relative_offset_bins) + 1,
+        ).to(dev)
+        if use_auxiliary_heads
+        else None
+    )
 
     gamma_scheduler = (
         GammaScheduler(
@@ -333,7 +422,10 @@ def train(
         if criterion is not None
         else None
     )
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optim_parameters = list(model.parameters())
+    if auxiliary_heads is not None:
+        optim_parameters.extend(auxiliary_heads.parameters())
+    optimizer = AdamW(optim_parameters, lr=lr, weight_decay=weight_decay)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=(dev.type == "cuda"))
 
@@ -352,6 +444,17 @@ def train(
         "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
         "anti_collapse_loss_weight": anti_collapse_loss_weight,
         "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
+        "temporal_order_loss_weight": temporal_order_loss_weight,
+        "relative_offset_loss_weight": relative_offset_loss_weight,
+        "relative_offset_bins": list(resolved_relative_offset_bins),
+        "masked_reconstruction_loss_weight": masked_reconstruction_loss_weight,
+        "cycle_consistency_loss_weight": cycle_consistency_loss_weight,
+        "cycle_entropy_loss_weight": cycle_entropy_loss_weight,
+        "cycle_monotonicity_loss_weight": cycle_monotonicity_loss_weight,
+        "cycle_smoothness_loss_weight": cycle_smoothness_loss_weight,
+        "hard_negative_loss_weight": hard_negative_loss_weight,
+        "hard_negative_radius_frames": hard_negative_radius_frames,
+        "memory_bank_size": memory_bank_size,
         "teacher_path_root": str(teacher_path_root) if teacher_path_root is not None else None,
         "self_mined_path_root": str(self_mined_path_root) if self_mined_path_root is not None else None,
         "num_anchor_samples": num_anchor_samples,
@@ -369,6 +472,7 @@ def train(
             checkpoint_path=resume_from,
             model=model,
             encoder=encoder,
+            auxiliary_heads=auxiliary_heads,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             scaler=scaler,
@@ -391,13 +495,25 @@ def train(
         train_path_distill_loss = 0.0
         train_sequence_contrastive_loss = 0.0
         train_anti_collapse_loss = 0.0
+        train_temporal_order_loss = 0.0
+        train_relative_offset_loss = 0.0
+        train_masked_reconstruction_loss = 0.0
+        train_cycle_consistency_loss = 0.0
+        train_cycle_entropy_loss = 0.0
+        train_cycle_monotonicity_loss = 0.0
+        train_cycle_smoothness_loss = 0.0
+        train_hard_negative_loss = 0.0
         n_batches = 0
 
         for batch in train_loader:
             spec_a = batch["spec_a"].to(dev)
             spec_b = batch["spec_b"].to(dev)
+            spec_neg = batch.get("spec_neg")
+            if spec_neg is not None:
+                spec_neg = spec_neg.to(dev)
             lengths_a = batch.get("lengths_a")
             lengths_b = batch.get("lengths_b")
+            lengths_neg = batch.get("lengths_neg")
             anchor_frames_a = batch.get("anchor_frame_indices_a")
             anchor_frames_b = batch.get("anchor_frame_indices_b")
             teacher_frames_a = batch.get("teacher_frame_indices_a")
@@ -448,10 +564,87 @@ def train(
                         lengths_b=lengths_b,
                     )
                     loss = loss + (anti_collapse_loss_weight * anti_collapse_component)
+                temporal_order_component = emb_a.new_zeros(())
+                relative_offset_component = emb_a.new_zeros(())
+                masked_reconstruction_component = emb_a.new_zeros(())
+                hard_negative_component = emb_a.new_zeros(())
+                emb_neg = None
+                if spec_neg is not None and (
+                    hard_negative_loss_fn is not None
+                    or temporal_order_loss_weight > 0
+                    or relative_offset_loss_weight > 0
+                ):
+                    emb_neg = model.encoder(spec_neg)
+                if auxiliary_heads is not None and emb_neg is not None:
+                    pooled_a = SequenceContrastiveLoss._masked_mean_pool(emb_a, lengths_a)
+                    pooled_neg = SequenceContrastiveLoss._masked_mean_pool(emb_neg, lengths_neg)
+                    pair_features = auxiliary_heads.pair_features(pooled_a, pooled_neg)
+                    if temporal_order_loss_weight > 0 and batch.get("temporal_order_label") is not None:
+                        temporal_labels = torch.as_tensor(
+                            batch["temporal_order_label"],
+                            device=dev,
+                            dtype=torch.long,
+                        )
+                        temporal_order_component = nn.functional.cross_entropy(
+                            auxiliary_heads.temporal_order(pair_features),
+                            temporal_labels,
+                        )
+                        loss = loss + (temporal_order_loss_weight * temporal_order_component)
+                    if relative_offset_loss_weight > 0 and batch.get("relative_offset_label") is not None:
+                        offset_labels = torch.as_tensor(
+                            batch["relative_offset_label"],
+                            device=dev,
+                            dtype=torch.long,
+                        )
+                        relative_offset_component = nn.functional.cross_entropy(
+                            auxiliary_heads.relative_offset(pair_features),
+                            offset_labels,
+                        )
+                        loss = loss + (relative_offset_loss_weight * relative_offset_component)
+                if auxiliary_heads is not None and reconstruction_loss_fn is not None:
+                    reconstruction_target = batch.get("reconstruction_target_a")
+                    reconstruction_mask = batch.get("reconstruction_mask_a")
+                    if reconstruction_target is not None and reconstruction_mask is not None:
+                        reconstructed = auxiliary_heads.reconstruction(emb_a)
+                        masked_reconstruction_component = reconstruction_loss_fn(
+                            reconstructed,
+                            reconstruction_target.to(dev),
+                            reconstruction_mask.to(dev),
+                        )
+                        loss = loss + (masked_reconstruction_loss_weight * masked_reconstruction_component)
+                if hard_negative_loss_fn is not None and emb_neg is not None:
+                    hard_negative_component = hard_negative_loss_fn(
+                        emb_a,
+                        emb_b,
+                        emb_neg,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                        lengths_neg=lengths_neg,
+                    )
+                    loss = loss + (hard_negative_loss_weight * hard_negative_component)
+                cycle_consistency_component = emb_a.new_zeros(())
+                cycle_entropy_component = emb_a.new_zeros(())
+                cycle_monotonicity_component = emb_a.new_zeros(())
+                cycle_smoothness_component = emb_a.new_zeros(())
+                if cycle_loss_fn is not None:
+                    cycle_components = cycle_loss_fn(
+                        emb_a,
+                        emb_b,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                    )
+                    cycle_consistency_component = cycle_components["cycle"]
+                    cycle_entropy_component = cycle_components["entropy"]
+                    cycle_monotonicity_component = cycle_components["monotonicity"]
+                    cycle_smoothness_component = cycle_components["smoothness"]
+                    loss = loss + (cycle_consistency_loss_weight * cycle_consistency_component)
+                    loss = loss + (cycle_entropy_loss_weight * cycle_entropy_component)
+                    loss = loss + (cycle_monotonicity_loss_weight * cycle_monotonicity_component)
+                    loss = loss + (cycle_smoothness_loss_weight * cycle_smoothness_component)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            nn.utils.clip_grad_norm_(optim_parameters, gradient_clip)
             scaler.step(optimizer)
             scaler.update()
 
@@ -462,6 +655,14 @@ def train(
             train_path_distill_loss += float(path_distill_component.item())
             train_sequence_contrastive_loss += float(sequence_component.item())
             train_anti_collapse_loss += float(anti_collapse_component.item())
+            train_temporal_order_loss += float(temporal_order_component.item())
+            train_relative_offset_loss += float(relative_offset_component.item())
+            train_masked_reconstruction_loss += float(masked_reconstruction_component.item())
+            train_cycle_consistency_loss += float(cycle_consistency_component.item())
+            train_cycle_entropy_loss += float(cycle_entropy_component.item())
+            train_cycle_monotonicity_loss += float(cycle_monotonicity_component.item())
+            train_cycle_smoothness_loss += float(cycle_smoothness_component.item())
+            train_hard_negative_loss += float(hard_negative_component.item())
             n_batches += 1
 
         train_loss /= max(n_batches, 1)
@@ -471,6 +672,14 @@ def train(
         train_path_distill_loss /= max(n_batches, 1)
         train_sequence_contrastive_loss /= max(n_batches, 1)
         train_anti_collapse_loss /= max(n_batches, 1)
+        train_temporal_order_loss /= max(n_batches, 1)
+        train_relative_offset_loss /= max(n_batches, 1)
+        train_masked_reconstruction_loss /= max(n_batches, 1)
+        train_cycle_consistency_loss /= max(n_batches, 1)
+        train_cycle_entropy_loss /= max(n_batches, 1)
+        train_cycle_monotonicity_loss /= max(n_batches, 1)
+        train_cycle_smoothness_loss /= max(n_batches, 1)
+        train_hard_negative_loss /= max(n_batches, 1)
         history["train_loss"].append(train_loss)
         history["train_soft_dtw_loss"].append(train_soft_dtw_loss)
         history["train_anchor_loss"].append(train_anchor_loss)
@@ -478,6 +687,14 @@ def train(
         history["train_path_distill_loss"].append(train_path_distill_loss)
         history["train_sequence_contrastive_loss"].append(train_sequence_contrastive_loss)
         history["train_anti_collapse_loss"].append(train_anti_collapse_loss)
+        history["train_temporal_order_loss"].append(train_temporal_order_loss)
+        history["train_relative_offset_loss"].append(train_relative_offset_loss)
+        history["train_masked_reconstruction_loss"].append(train_masked_reconstruction_loss)
+        history["train_cycle_consistency_loss"].append(train_cycle_consistency_loss)
+        history["train_cycle_entropy_loss"].append(train_cycle_entropy_loss)
+        history["train_cycle_monotonicity_loss"].append(train_cycle_monotonicity_loss)
+        history["train_cycle_smoothness_loss"].append(train_cycle_smoothness_loss)
+        history["train_hard_negative_loss"].append(train_hard_negative_loss)
 
         model.eval()
         val_loss = 0.0
@@ -486,8 +703,12 @@ def train(
             for batch in val_loader:
                 spec_a = batch["spec_a"].to(dev)
                 spec_b = batch["spec_b"].to(dev)
+                spec_neg = batch.get("spec_neg")
+                if spec_neg is not None:
+                    spec_neg = spec_neg.to(dev)
                 lengths_a = batch.get("lengths_a")
                 lengths_b = batch.get("lengths_b")
+                lengths_neg = batch.get("lengths_neg")
                 emb_a, emb_b = model(spec_a, spec_b)
                 if criterion is not None:
                     loss = criterion(emb_a, emb_b, lengths_a=lengths_a, lengths_b=lengths_b)
@@ -534,6 +755,78 @@ def train(
                             lengths_b=lengths_b,
                         )
                     )
+                emb_neg = None
+                if spec_neg is not None and (
+                    hard_negative_loss_fn is not None
+                    or temporal_order_loss_weight > 0
+                    or relative_offset_loss_weight > 0
+                ):
+                    emb_neg = model.encoder(spec_neg)
+                if auxiliary_heads is not None and emb_neg is not None:
+                    pooled_a = SequenceContrastiveLoss._masked_mean_pool(emb_a, lengths_a)
+                    pooled_neg = SequenceContrastiveLoss._masked_mean_pool(emb_neg, lengths_neg)
+                    pair_features = auxiliary_heads.pair_features(pooled_a, pooled_neg)
+                    if temporal_order_loss_weight > 0 and batch.get("temporal_order_label") is not None:
+                        temporal_labels = torch.as_tensor(
+                            batch["temporal_order_label"],
+                            device=dev,
+                            dtype=torch.long,
+                        )
+                        loss = loss + (
+                            temporal_order_loss_weight
+                            * nn.functional.cross_entropy(
+                                auxiliary_heads.temporal_order(pair_features),
+                                temporal_labels,
+                            )
+                        )
+                    if relative_offset_loss_weight > 0 and batch.get("relative_offset_label") is not None:
+                        offset_labels = torch.as_tensor(
+                            batch["relative_offset_label"],
+                            device=dev,
+                            dtype=torch.long,
+                        )
+                        loss = loss + (
+                            relative_offset_loss_weight
+                            * nn.functional.cross_entropy(
+                                auxiliary_heads.relative_offset(pair_features),
+                                offset_labels,
+                            )
+                        )
+                if auxiliary_heads is not None and reconstruction_loss_fn is not None:
+                    reconstruction_target = batch.get("reconstruction_target_a")
+                    reconstruction_mask = batch.get("reconstruction_mask_a")
+                    if reconstruction_target is not None and reconstruction_mask is not None:
+                        loss = loss + (
+                            masked_reconstruction_loss_weight
+                            * reconstruction_loss_fn(
+                                auxiliary_heads.reconstruction(emb_a),
+                                reconstruction_target.to(dev),
+                                reconstruction_mask.to(dev),
+                            )
+                        )
+                if hard_negative_loss_fn is not None and emb_neg is not None:
+                    loss = loss + (
+                        hard_negative_loss_weight
+                        * hard_negative_loss_fn(
+                            emb_a,
+                            emb_b,
+                            emb_neg,
+                            lengths_a=lengths_a,
+                            lengths_b=lengths_b,
+                            lengths_neg=lengths_neg,
+                        )
+                    )
+                if cycle_loss_fn is not None:
+                    cycle_components = cycle_loss_fn(
+                        emb_a,
+                        emb_b,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                    )
+                    loss = loss + (cycle_consistency_loss_weight * cycle_components["cycle"])
+                    loss = loss + (cycle_entropy_loss_weight * cycle_components["entropy"])
+                    loss = loss + (cycle_monotonicity_loss_weight * cycle_components["monotonicity"])
+                    loss = loss + (cycle_smoothness_loss_weight * cycle_components["smoothness"])
                 val_loss += float(loss.item())
                 n_val_batches += 1
 
@@ -610,6 +903,7 @@ def train(
         logger.info(
             "Epoch %s/%s | Train: %.4f | SoftDTW: %.4f | Anchor: %.4f | "
             "Dense: %.4f | Distill: %.4f | Seq: %.4f | AntiCollapse: %.4f | "
+            "Order: %.4f | Offset: %.4f | Recon: %.4f | Cycle: %.4f/%.4f/%.4f/%.4f | HardNeg: %.4f | "
             "Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
             "Debug AR@100: %.4f | Val MAE: %.4f | Val AR@50: %.4f | Val AR@100: %.4f | "
             "gamma: %.4f | LR: %.2e | Time: %.1fs",
@@ -622,6 +916,14 @@ def train(
             train_path_distill_loss,
             train_sequence_contrastive_loss,
             train_anti_collapse_loss,
+            train_temporal_order_loss,
+            train_relative_offset_loss,
+            train_masked_reconstruction_loss,
+            train_cycle_consistency_loss,
+            train_cycle_entropy_loss,
+            train_cycle_monotonicity_loss,
+            train_cycle_smoothness_loss,
+            train_hard_negative_loss,
             val_loss,
             debug_metrics["mae"],
             debug_metrics["ar_50ms"],
@@ -638,6 +940,7 @@ def train(
             epoch=epoch,
             model=model,
             encoder=encoder,
+            auxiliary_heads=auxiliary_heads,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             scaler=scaler,
@@ -684,6 +987,17 @@ def train(
                 "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
                 "anti_collapse_loss_weight": anti_collapse_loss_weight,
                 "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
+                "temporal_order_loss_weight": temporal_order_loss_weight,
+                "relative_offset_loss_weight": relative_offset_loss_weight,
+                "relative_offset_bins": list(resolved_relative_offset_bins),
+                "masked_reconstruction_loss_weight": masked_reconstruction_loss_weight,
+                "cycle_consistency_loss_weight": cycle_consistency_loss_weight,
+                "cycle_entropy_loss_weight": cycle_entropy_loss_weight,
+                "cycle_monotonicity_loss_weight": cycle_monotonicity_loss_weight,
+                "cycle_smoothness_loss_weight": cycle_smoothness_loss_weight,
+                "hard_negative_loss_weight": hard_negative_loss_weight,
+                "hard_negative_radius_frames": hard_negative_radius_frames,
+                "memory_bank_size": memory_bank_size,
                 "teacher_path_root": teacher_path_root,
                 "self_mined_path_root": self_mined_path_root,
                 "num_anchor_samples": num_anchor_samples,
@@ -705,6 +1019,7 @@ def train(
                     epoch=epoch,
                     model=model,
                     encoder=encoder,
+                    auxiliary_heads=auxiliary_heads,
                     optimizer=optimizer,
                     lr_scheduler=lr_scheduler,
                     scaler=scaler,
@@ -751,6 +1066,17 @@ def train(
                         "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
                         "anti_collapse_loss_weight": anti_collapse_loss_weight,
                         "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
+                        "temporal_order_loss_weight": temporal_order_loss_weight,
+                        "relative_offset_loss_weight": relative_offset_loss_weight,
+                        "relative_offset_bins": list(resolved_relative_offset_bins),
+                        "masked_reconstruction_loss_weight": masked_reconstruction_loss_weight,
+                        "cycle_consistency_loss_weight": cycle_consistency_loss_weight,
+                        "cycle_entropy_loss_weight": cycle_entropy_loss_weight,
+                        "cycle_monotonicity_loss_weight": cycle_monotonicity_loss_weight,
+                        "cycle_smoothness_loss_weight": cycle_smoothness_loss_weight,
+                        "hard_negative_loss_weight": hard_negative_loss_weight,
+                        "hard_negative_radius_frames": hard_negative_radius_frames,
+                        "memory_bank_size": memory_bank_size,
                         "teacher_path_root": teacher_path_root,
                         "self_mined_path_root": self_mined_path_root,
                         "num_anchor_samples": num_anchor_samples,
@@ -795,6 +1121,14 @@ def _empty_history() -> dict[str, list[float]]:
         "train_path_distill_loss": [],
         "train_sequence_contrastive_loss": [],
         "train_anti_collapse_loss": [],
+        "train_temporal_order_loss": [],
+        "train_relative_offset_loss": [],
+        "train_masked_reconstruction_loss": [],
+        "train_cycle_consistency_loss": [],
+        "train_cycle_entropy_loss": [],
+        "train_cycle_monotonicity_loss": [],
+        "train_cycle_smoothness_loss": [],
+        "train_hard_negative_loss": [],
         "val_loss": [],
         "debug_mae": [],
         "debug_ar50": [],
@@ -836,11 +1170,13 @@ def _build_checkpoint_payload(
     selection_snapshots: dict[str, dict[str, Any]],
     training_state_signature: dict[str, Any],
     config: dict[str, Any],
+    auxiliary_heads: nn.Module | None = None,
 ) -> dict[str, Any]:
     return {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "encoder_state_dict": encoder.state_dict(),
+        "auxiliary_state_dict": auxiliary_heads.state_dict() if auxiliary_heads is not None else None,
         "optimizer_state_dict": optimizer.state_dict(),
         "lr_scheduler_state_dict": lr_scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
@@ -864,6 +1200,7 @@ def _load_resume_state(
     lr_scheduler: CosineAnnealingLR,
     scaler: torch.amp.GradScaler,
     current_signature: dict[str, Any],
+    auxiliary_heads: nn.Module | None = None,
 ) -> tuple[int, dict[str, list[float]], dict[str, Any] | None, dict[str, dict[str, Any]]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
@@ -873,6 +1210,9 @@ def _load_resume_state(
         model.load_state_dict(checkpoint["model_state_dict"])
     else:
         raise ValueError(f"Checkpoint at {checkpoint_path} does not contain model weights.")
+
+    if auxiliary_heads is not None and checkpoint.get("auxiliary_state_dict") is not None:
+        auxiliary_heads.load_state_dict(checkpoint["auxiliary_state_dict"])
 
     saved_signature = checkpoint.get("training_state_signature")
     if _normalise_training_state_signature(saved_signature) == _normalise_training_state_signature(
@@ -913,6 +1253,17 @@ def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None
     normalised.setdefault("sequence_contrastive_loss_weight", 0.0)
     normalised.setdefault("anti_collapse_loss_weight", 0.0)
     normalised.setdefault("anti_collapse_covariance_weight", 0.01)
+    normalised.setdefault("temporal_order_loss_weight", 0.0)
+    normalised.setdefault("relative_offset_loss_weight", 0.0)
+    normalised.setdefault("relative_offset_bins", [8, 24, 64, 128])
+    normalised.setdefault("masked_reconstruction_loss_weight", 0.0)
+    normalised.setdefault("cycle_consistency_loss_weight", 0.0)
+    normalised.setdefault("cycle_entropy_loss_weight", 0.0)
+    normalised.setdefault("cycle_monotonicity_loss_weight", 0.0)
+    normalised.setdefault("cycle_smoothness_loss_weight", 0.0)
+    normalised.setdefault("hard_negative_loss_weight", 0.0)
+    normalised.setdefault("hard_negative_radius_frames", 96)
+    normalised.setdefault("memory_bank_size", 0)
     normalised.setdefault("teacher_path_root", None)
     normalised.setdefault("self_mined_path_root", None)
     normalised.setdefault("num_anchor_samples", 64)
@@ -1102,9 +1453,12 @@ def _validate_headline_claim_config(config: dict[str, Any], *, path: str | None 
     evaluation_cfg = config.get("evaluation", {})
     errors: list[str] = []
 
-    strict_sampling_modes = {"self_audio", "same_lied_pair", "self_mined_path"}
+    strict_sampling_modes = {"self_audio", "self_audio_ordered", "same_lied_pair", "self_mined_path"}
     if dataset_cfg.get("segment_sampling") not in strict_sampling_modes:
-        errors.append("dataset.segment_sampling must be one of {'self_audio', 'same_lied_pair', 'self_mined_path'}")
+        errors.append(
+            "dataset.segment_sampling must be one of "
+            "{'self_audio', 'self_audio_ordered', 'same_lied_pair', 'self_mined_path'}"
+        )
 
     for key in ("anchor_loss_weight", "dense_anchor_loss_weight"):
         if float(training_cfg.get(key, 0.0) or 0.0) > 0.0:
@@ -1331,6 +1685,61 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("anti_collapse_covariance_weight"),
             0.01,
         ),
+        "temporal_order_loss_weight": _resolve_option(
+            getattr(args, "temporal_order_loss_weight", None),
+            training_cfg.get("temporal_order_loss_weight"),
+            0.0,
+        ),
+        "relative_offset_loss_weight": _resolve_option(
+            getattr(args, "relative_offset_loss_weight", None),
+            training_cfg.get("relative_offset_loss_weight"),
+            0.0,
+        ),
+        "relative_offset_bins": _resolve_option(
+            getattr(args, "relative_offset_bins", None),
+            training_cfg.get("relative_offset_bins"),
+            None,
+        ),
+        "masked_reconstruction_loss_weight": _resolve_option(
+            getattr(args, "masked_reconstruction_loss_weight", None),
+            training_cfg.get("masked_reconstruction_loss_weight"),
+            0.0,
+        ),
+        "cycle_consistency_loss_weight": _resolve_option(
+            getattr(args, "cycle_consistency_loss_weight", None),
+            training_cfg.get("cycle_consistency_loss_weight"),
+            0.0,
+        ),
+        "cycle_entropy_loss_weight": _resolve_option(
+            getattr(args, "cycle_entropy_loss_weight", None),
+            training_cfg.get("cycle_entropy_loss_weight"),
+            0.0,
+        ),
+        "cycle_monotonicity_loss_weight": _resolve_option(
+            getattr(args, "cycle_monotonicity_loss_weight", None),
+            training_cfg.get("cycle_monotonicity_loss_weight"),
+            0.0,
+        ),
+        "cycle_smoothness_loss_weight": _resolve_option(
+            getattr(args, "cycle_smoothness_loss_weight", None),
+            training_cfg.get("cycle_smoothness_loss_weight"),
+            0.0,
+        ),
+        "hard_negative_loss_weight": _resolve_option(
+            getattr(args, "hard_negative_loss_weight", None),
+            training_cfg.get("hard_negative_loss_weight"),
+            0.0,
+        ),
+        "hard_negative_radius_frames": _resolve_option(
+            getattr(args, "hard_negative_radius_frames", None),
+            training_cfg.get("hard_negative_radius_frames"),
+            96,
+        ),
+        "memory_bank_size": _resolve_option(
+            getattr(args, "memory_bank_size", None),
+            training_cfg.get("memory_bank_size"),
+            0,
+        ),
         "teacher_path_root": _resolve_option(
             args.teacher_path_root,
             training_cfg.get("teacher_path_root"),
@@ -1406,7 +1815,15 @@ def main() -> None:
     parser.add_argument(
         "--segment-sampling",
         type=str,
-        choices=["aligned_measures", "independent_random", "teacher_path", "self_audio", "same_lied_pair", "self_mined_path"],
+        choices=[
+            "aligned_measures",
+            "independent_random",
+            "teacher_path",
+            "self_audio",
+            "self_audio_ordered",
+            "same_lied_pair",
+            "self_mined_path",
+        ],
         default=None,
     )
     parser.add_argument("--samples-per-epoch", type=int, default=None)
@@ -1435,6 +1852,17 @@ def main() -> None:
     parser.add_argument("--sequence-contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--anti-collapse-loss-weight", type=float, default=None)
     parser.add_argument("--anti-collapse-covariance-weight", type=float, default=None)
+    parser.add_argument("--temporal-order-loss-weight", type=float, default=None)
+    parser.add_argument("--relative-offset-loss-weight", type=float, default=None)
+    parser.add_argument("--relative-offset-bins", type=int, nargs="+", default=None)
+    parser.add_argument("--masked-reconstruction-loss-weight", type=float, default=None)
+    parser.add_argument("--cycle-consistency-loss-weight", type=float, default=None)
+    parser.add_argument("--cycle-entropy-loss-weight", type=float, default=None)
+    parser.add_argument("--cycle-monotonicity-loss-weight", type=float, default=None)
+    parser.add_argument("--cycle-smoothness-loss-weight", type=float, default=None)
+    parser.add_argument("--hard-negative-loss-weight", type=float, default=None)
+    parser.add_argument("--hard-negative-radius-frames", type=int, default=None)
+    parser.add_argument("--memory-bank-size", type=int, default=None)
     parser.add_argument("--teacher-path-root", type=str, default=None)
     parser.add_argument("--self-mined-path-root", type=str, default=None)
     parser.add_argument("--num-anchor-samples", type=int, default=None)

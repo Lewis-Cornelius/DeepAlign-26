@@ -286,6 +286,163 @@ class SequenceContrastiveLoss(nn.Module):
         return mask
 
 
+class HardNegativeContrastiveLoss(nn.Module):
+    """
+    Contrast same-audio positives against nearby confusable windows.
+
+    The positive is the row-wise pair (A_i, B_i); ``emb_neg`` contains a third
+    crop from the same recording, sampled close enough in time to be musically
+    plausible but not identical. The loss asks the positive similarity to beat
+    the hard negative by a margin.
+    """
+
+    def __init__(self, margin: float = 0.2):
+        super().__init__()
+        self.margin = float(margin)
+
+    def forward(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        emb_neg: Tensor,
+        lengths_a: Tensor | Sequence[int] | None = None,
+        lengths_b: Tensor | Sequence[int] | None = None,
+        lengths_neg: Tensor | Sequence[int] | None = None,
+    ) -> Tensor:
+        pooled_a = SequenceContrastiveLoss._masked_mean_pool(emb_a, lengths_a)
+        pooled_b = SequenceContrastiveLoss._masked_mean_pool(emb_b, lengths_b)
+        pooled_neg = SequenceContrastiveLoss._masked_mean_pool(emb_neg, lengths_neg)
+        pooled_a = nn.functional.normalize(pooled_a, dim=-1)
+        pooled_b = nn.functional.normalize(pooled_b, dim=-1)
+        pooled_neg = nn.functional.normalize(pooled_neg, dim=-1)
+
+        positive = (pooled_a * pooled_b).sum(dim=-1)
+        negative_a = (pooled_a * pooled_neg).sum(dim=-1)
+        negative_b = (pooled_b * pooled_neg).sum(dim=-1)
+        loss_a = torch.relu(self.margin + negative_a - positive)
+        loss_b = torch.relu(self.margin + negative_b - positive)
+        return torch.stack([loss_a, loss_b], dim=0).mean()
+
+
+class MaskedReconstructionLoss(nn.Module):
+    """Reconstruct only the masked CQT frames used by Stage 1 v2."""
+
+    def forward(self, prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+        if target.ndim == 4:
+            target = target.squeeze(1).transpose(1, 2)
+        if mask.ndim == 4:
+            mask = mask.squeeze(1).transpose(1, 2)
+        mask = mask.to(device=prediction.device, dtype=prediction.dtype)
+        target = target.to(device=prediction.device, dtype=prediction.dtype)
+        if mask.shape != prediction.shape:
+            mask = mask.expand_as(prediction)
+        denom = mask.sum().clamp_min(1.0)
+        return ((prediction - target).pow(2) * mask).sum() / denom
+
+
+class CycleAlignmentLoss(nn.Module):
+    """
+    Strict same-lied soft alignment loss without timestamps or decode bands.
+
+    It builds unconstrained soft A->B and B->A alignments from learned feature
+    similarities, then penalizes cycles that fail to return to the source frame.
+    Optional entropy and monotonicity components are exposed separately so the
+    trainer can weight them independently.
+    """
+
+    def __init__(self, temperature: float = 0.05):
+        super().__init__()
+        self.temperature = float(temperature)
+
+    def forward(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        lengths_a: Tensor | Sequence[int] | None = None,
+        lengths_b: Tensor | Sequence[int] | None = None,
+    ) -> dict[str, Tensor]:
+        losses: list[Tensor] = []
+        entropies: list[Tensor] = []
+        monotonicities: list[Tensor] = []
+        smoothnesses: list[Tensor] = []
+        device = emb_a.device
+
+        len_a = self._length_tensor(lengths_a, batch_size=emb_a.shape[0], max_len=emb_a.shape[1], device=device)
+        len_b = self._length_tensor(lengths_b, batch_size=emb_b.shape[0], max_len=emb_b.shape[1], device=device)
+
+        for batch_idx in range(emb_a.shape[0]):
+            n_a = int(len_a[batch_idx].item())
+            n_b = int(len_b[batch_idx].item())
+            if n_a < 2 or n_b < 2:
+                continue
+
+            a = nn.functional.normalize(emb_a[batch_idx, :n_a], dim=-1)
+            b = nn.functional.normalize(emb_b[batch_idx, :n_b], dim=-1)
+            logits_ab = (a @ b.T) / self.temperature
+            logits_ba = logits_ab.T
+            prob_ab = nn.functional.softmax(logits_ab, dim=-1)
+            prob_ba = nn.functional.softmax(logits_ba, dim=-1)
+
+            pos_a = torch.linspace(0.0, 1.0, n_a, device=device, dtype=emb_a.dtype)
+            pos_b = torch.linspace(0.0, 1.0, n_b, device=device, dtype=emb_a.dtype)
+            cycle_a = prob_ab @ prob_ba
+            cycle_b = prob_ba @ prob_ab
+            expected_back_a = cycle_a @ pos_a
+            expected_back_b = cycle_b @ pos_b
+            cycle_loss = nn.functional.mse_loss(expected_back_a, pos_a) + nn.functional.mse_loss(
+                expected_back_b,
+                pos_b,
+            )
+            losses.append(cycle_loss)
+
+            ent_ab = self._normalised_entropy(prob_ab)
+            ent_ba = self._normalised_entropy(prob_ba)
+            entropies.append((ent_ab + ent_ba) * 0.5)
+
+            expected_b = prob_ab @ pos_b
+            expected_a = prob_ba @ pos_a
+            mono_ab = torch.relu(-(expected_b[1:] - expected_b[:-1])).mean()
+            mono_ba = torch.relu(-(expected_a[1:] - expected_a[:-1])).mean()
+            monotonicities.append((mono_ab + mono_ba) * 0.5)
+
+            smooth_ab = self._slope_smoothness(expected_b)
+            smooth_ba = self._slope_smoothness(expected_a)
+            smoothnesses.append((smooth_ab + smooth_ba) * 0.5)
+
+        zero = emb_a.new_zeros(())
+        return {
+            "cycle": torch.stack(losses).mean() if losses else zero,
+            "entropy": torch.stack(entropies).mean() if entropies else zero,
+            "monotonicity": torch.stack(monotonicities).mean() if monotonicities else zero,
+            "smoothness": torch.stack(smoothnesses).mean() if smoothnesses else zero,
+        }
+
+    @staticmethod
+    def _normalised_entropy(prob: Tensor) -> Tensor:
+        entropy = -(prob * prob.clamp_min(1e-8).log()).sum(dim=-1)
+        normaliser = torch.log(torch.as_tensor(prob.shape[-1], device=prob.device, dtype=prob.dtype)).clamp_min(1e-8)
+        return (entropy / normaliser).mean()
+
+    @staticmethod
+    def _slope_smoothness(expected_positions: Tensor) -> Tensor:
+        if expected_positions.numel() < 3:
+            return expected_positions.new_zeros(())
+        slopes = (expected_positions[1:] - expected_positions[:-1]) * max(expected_positions.numel() - 1, 1)
+        return (slopes[1:] - slopes[:-1]).pow(2).mean()
+
+    @staticmethod
+    def _length_tensor(
+        lengths: Tensor | Sequence[int] | None,
+        *,
+        batch_size: int,
+        max_len: int,
+        device: torch.device,
+    ) -> Tensor:
+        if lengths is None:
+            return torch.full((batch_size,), max_len, device=device, dtype=torch.long)
+        return torch.as_tensor(lengths, device=device, dtype=torch.long).clamp(min=0, max=max_len)
+
+
 class EmbeddingAntiCollapseLoss(nn.Module):
     """
     Penalize collapsed embeddings with a VICReg-style variance/covariance term.

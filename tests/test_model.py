@@ -384,6 +384,44 @@ class TestStrictAudioOnlyLosses:
 
         assert collapsed_loss.item() > varied_loss.item()
 
+    def test_hard_negative_loss_is_low_when_positive_is_clear(self):
+        from dis_alignment.model.anchor_loss import HardNegativeContrastiveLoss
+
+        loss_fn = HardNegativeContrastiveLoss(margin=0.2)
+        emb_a = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+        emb_b = emb_a.clone()
+        emb_neg = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]])
+
+        loss = loss_fn(emb_a, emb_b, emb_neg)
+
+        assert loss.item() == pytest.approx(0.0)
+
+    def test_masked_reconstruction_ignores_unmasked_frames(self):
+        from dis_alignment.model.anchor_loss import MaskedReconstructionLoss
+
+        loss_fn = MaskedReconstructionLoss()
+        prediction = torch.zeros(1, 3, 2)
+        target = torch.zeros(1, 1, 2, 3)
+        target[:, :, :, 0] = 10.0
+        mask = torch.zeros_like(target)
+        mask[:, :, :, 1] = 1.0
+
+        loss = loss_fn(prediction, target, mask)
+
+        assert loss.item() == pytest.approx(0.0)
+
+    def test_cycle_loss_is_low_for_identity_features(self):
+        from dis_alignment.model.anchor_loss import CycleAlignmentLoss
+
+        loss_fn = CycleAlignmentLoss(temperature=0.01)
+        emb = torch.eye(5).unsqueeze(0)
+
+        components = loss_fn(emb, emb.clone())
+
+        assert components["cycle"].item() < 1e-3
+        assert components["monotonicity"].item() < 1e-3
+        assert components["smoothness"].item() < 1e-3
+
 
 class TestMemoryEfficientDtw:
     """Tests for strict full-DTW decoding without dense float64 matrices."""
@@ -519,6 +557,35 @@ class TestCollateVariableLength:
         assert collated["lengths_a"].tolist() == [50, 80]
         assert collated["lengths_b"].tolist() == [30, 60]
         assert len(collated["pair_ids"]) == 2
+
+    def test_pads_optional_hard_negative_and_reconstruction_tensors(self):
+        from dis_alignment.model.dataset import collate_variable_length
+
+        batch = [
+            {
+                "spec_a": torch.randn(1, 2, 5),
+                "spec_b": torch.randn(1, 2, 5),
+                "spec_neg": torch.randn(1, 2, 3),
+                "reconstruction_target_a": torch.randn(1, 2, 5),
+                "reconstruction_mask_a": torch.ones(1, 2, 5),
+                "pair_id": "a",
+            },
+            {
+                "spec_a": torch.randn(1, 2, 7),
+                "spec_b": torch.randn(1, 2, 4),
+                "spec_neg": torch.randn(1, 2, 6),
+                "reconstruction_target_a": torch.randn(1, 2, 7),
+                "reconstruction_mask_a": torch.ones(1, 2, 7),
+                "pair_id": "b",
+            },
+        ]
+
+        collated = collate_variable_length(batch)
+
+        assert collated["spec_neg"].shape == (2, 1, 2, 6)
+        assert collated["lengths_neg"].tolist() == [3, 6]
+        assert collated["reconstruction_target_a"].shape == (2, 1, 2, 7)
+        assert collated["reconstruction_mask_a"].shape == (2, 1, 2, 7)
 
 
 class TestSWDPairDatasetSampling:
@@ -710,6 +777,99 @@ class TestSWDPairDatasetSampling:
         assert item["teacher_frame_indices_a"] == item["teacher_frame_indices_b"]
         assert len(item["teacher_frame_indices_a"]) == 5
 
+    def test_self_audio_ordered_sampling_uses_raw_time_indices_only(self, monkeypatch, tmp_path):
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        pair = _make_pair(tmp_path, "D911-13")
+        monkeypatch.setattr(
+            dataset_module,
+            "compute_ground_truth_measure_alignment",
+            lambda pair_arg: (_ for _ in ()).throw(AssertionError("measure anchors used")),
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.arange(240, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.tile(audio[: max(1, len(audio) // 10)], (2, 1)).astype(np.float32),
+        )
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=10,
+            max_length_sec=6.0,
+            segment_sampling="self_audio_ordered",
+            deterministic=True,
+            num_teacher_samples=5,
+            hard_negative_radius_frames=4,
+            relative_offset_bins=[1, 2, 4],
+        )
+
+        item = dataset[0]
+
+        assert item["segment_sampling"] == "self_audio_ordered"
+        assert item["anchor_frame_indices_a"] == []
+        assert item["anchor_frame_indices_b"] == []
+        assert item["positive_start_sample"] != item["anchor_start_sample"]
+        frame_offset = round(
+            (item["anchor_start_sample"] - item["positive_start_sample"]) / dataset.hop_length
+        )
+        assert all(
+            (frame_b - frame_a) == frame_offset
+            for frame_a, frame_b in zip(
+                item["teacher_frame_indices_a"],
+                item["teacher_frame_indices_b"],
+                strict=False,
+            )
+        )
+        assert item["spec_neg"].shape[-1] > 0
+        assert item["temporal_order_label"] in {0, 1, 2}
+        assert 0 <= item["relative_offset_label"] <= 3
+        assert item["reconstruction_target_a"].shape == item["spec_a"].shape
+        assert item["reconstruction_mask_a"].sum() > 0
+
+    def test_self_audio_ordered_raw_shift_frames_follow_overlap(self, tmp_path):
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        dataset = SWDPairDataset(
+            pairs=[_make_pair(tmp_path, "D911-15")],
+            sr=10,
+            hop_length=10,
+            max_length_sec=6.0,
+            segment_sampling="self_audio_ordered",
+            deterministic=True,
+            num_teacher_samples=4,
+        )
+
+        frames_a, frames_b = dataset._raw_offset_frames_for_specs(
+            8,
+            8,
+            start_a_sample=50,
+            start_b_sample=70,
+        )
+
+        assert frames_a == [2, 3, 5, 7]
+        assert frames_b == [0, 1, 3, 5]
+
+    def test_relative_offset_bins_are_coarse_raw_frame_distances(self, tmp_path):
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        dataset = SWDPairDataset(
+            pairs=[_make_pair(tmp_path, "D911-14")],
+            segment_sampling="self_audio_ordered",
+            relative_offset_bins=[2, 5, 9],
+        )
+
+        assert dataset._relative_offset_bin(0) == 0
+        assert dataset._relative_offset_bin(2) == 1
+        assert dataset._relative_offset_bin(6) == 2
+        assert dataset._relative_offset_bin(12) == 3
+
     def test_same_lied_pair_sampling_uses_no_measure_anchors(self, monkeypatch, tmp_path):
         from dis_alignment.model import dataset as dataset_module
         from dis_alignment.model.dataset import SWDPairDataset
@@ -802,6 +962,77 @@ class TestSWDPairDatasetSampling:
         assert item["segment_sampling"] == "self_mined_path"
         assert item["anchor_frame_indices_a"] == []
         assert len(item["teacher_frame_indices_a"]) == 4
+
+    def test_self_mined_path_sampling_filters_low_confidence_frames(self, monkeypatch, tmp_path):
+        from dis_alignment.alignment.teacher import TeacherPath, save_teacher_path
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        pair = _make_pair(tmp_path, "D911-16")
+        mined_root = tmp_path / "self_mined_confidence"
+        times = np.arange(0, 20, dtype=np.float64)
+        confidence = np.zeros(times.shape, dtype=np.float32)
+        confidence[8:13] = 0.9
+        save_teacher_path(
+            TeacherPath(
+                pair_id=pair.pair_id,
+                lied_id=pair.lied_id,
+                piece_a_id=pair.piece_a.piece_id,
+                piece_b_id=pair.piece_b.piece_id,
+                frame_hop=10,
+                sr=10,
+                path=np.vstack([np.arange(times.size), np.arange(times.size)]),
+                time_a_s=times,
+                time_b_s=times,
+                confidence=confidence,
+            ),
+            mined_root,
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.zeros(300, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.ones((2, max(1, len(audio) // 10)), dtype=np.float32),
+        )
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=10,
+            max_length_sec=10.0,
+            segment_sampling="self_mined_path",
+            deterministic=True,
+            self_mined_path_root=mined_root,
+            teacher_min_confidence=0.8,
+            num_teacher_samples=8,
+        )
+
+        item = dataset[0]
+
+        assert item["teacher_frame_indices_a"]
+        assert len(item["teacher_frame_indices_a"]) <= 5
+
+    def test_self_mined_confidence_prefers_local_margin(self):
+        from dis_alignment.cli import _self_mined_path_confidence
+
+        features = np.eye(5, dtype=np.float32)
+        path = np.vstack([np.arange(5), np.arange(5)])
+
+        confidence = _self_mined_path_confidence(
+            features,
+            features,
+            path,
+            distance="sqeuclidean",
+            local_radius=1,
+            margin_scale=0.25,
+        )
+
+        assert confidence[2] > 0.95
+        assert confidence.shape == (5,)
 
     def test_waveform_augmentation_is_applied_to_both_sides(self, monkeypatch, tmp_path):
         from dis_alignment.model import dataset as dataset_module
@@ -1168,6 +1399,102 @@ class TestTrainingPairSplit:
         assert kwargs["eval_pool_size"] == 1
         assert kwargs["alignment_eval_every_n_epochs"] == 0
 
+    def test_training_kwargs_reads_strict_stage1_v2_keys(self, tmp_path):
+        from dis_alignment.model.train import _build_training_kwargs
+
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(
+            "dataset:\n"
+            "  segment_sampling: self_audio_ordered\n"
+            "training:\n"
+            "  temporal_order_loss_weight: 0.4\n"
+            "  relative_offset_loss_weight: 0.5\n"
+            "  relative_offset_bins: [4, 8, 16]\n"
+            "  masked_reconstruction_loss_weight: 0.1\n"
+            "  hard_negative_loss_weight: 0.3\n"
+            "  hard_negative_radius_frames: 32\n"
+            "  memory_bank_size: 128\n"
+            "soft_dtw:\n"
+            "  loss_weight: 0.0\n",
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            config=str(config_path),
+            swd_path=None,
+            output_dir=None,
+            epochs=None,
+            batch_size=None,
+            lr=None,
+            embed_dim=None,
+            sr=None,
+            hop_length=None,
+            n_freq_bins=None,
+            conv_channels=None,
+            gru_hidden_size=None,
+            num_gru_layers=None,
+            dropout=None,
+            temporal_attention_heads=None,
+            max_length_sec=None,
+            segment_sampling=None,
+            samples_per_epoch=None,
+            device=None,
+            start_gamma=None,
+            end_gamma=None,
+            soft_dtw_loss_weight=None,
+            gradient_clip=None,
+            weight_decay=None,
+            val_split=None,
+            save_every_n_epochs=None,
+            dist_func=None,
+            resume_from=None,
+            selection_metric=None,
+            cache_root=None,
+            deep_decode=None,
+            band_radius_frames=None,
+            anchor_loss_weight=None,
+            dense_anchor_loss_weight=None,
+            path_distill_loss_weight=None,
+            temporal_order_loss_weight=None,
+            relative_offset_loss_weight=None,
+            relative_offset_bins=None,
+            masked_reconstruction_loss_weight=None,
+            cycle_consistency_loss_weight=None,
+            cycle_entropy_loss_weight=None,
+            cycle_monotonicity_loss_weight=None,
+            cycle_smoothness_loss_weight=None,
+            hard_negative_loss_weight=None,
+            hard_negative_radius_frames=None,
+            memory_bank_size=None,
+            teacher_path_root=None,
+            self_mined_path_root=None,
+            num_anchor_samples=None,
+            teacher_min_confidence=None,
+            disable_time_stretch_for_anchors=None,
+            eval_pool_size=None,
+            alignment_eval_every_n_epochs=None,
+            sequence_contrastive_loss_weight=None,
+            anti_collapse_loss_weight=None,
+            anti_collapse_covariance_weight=None,
+            anchor_temperature=None,
+            anchor_min_anchor_gap=None,
+            track_debug_checkpoints=None,
+            no_augment=False,
+            dry_run=False,
+            cache_spectrograms=None,
+            normalize_loss=None,
+        )
+
+        kwargs = _build_training_kwargs(args)
+
+        assert kwargs["segment_sampling"] == "self_audio_ordered"
+        assert kwargs["temporal_order_loss_weight"] == pytest.approx(0.4)
+        assert kwargs["relative_offset_loss_weight"] == pytest.approx(0.5)
+        assert kwargs["relative_offset_bins"] == [4, 8, 16]
+        assert kwargs["masked_reconstruction_loss_weight"] == pytest.approx(0.1)
+        assert kwargs["hard_negative_loss_weight"] == pytest.approx(0.3)
+        assert kwargs["hard_negative_radius_frames"] == 32
+        assert kwargs["memory_bank_size"] == 128
+
     def test_headline_claim_config_accepts_strict_audio_only_route(self):
         from dis_alignment.model.train import _validate_headline_claim_config
 
@@ -1181,6 +1508,31 @@ class TestTrainingPairSplit:
                 "path_distill_loss_weight": 0.0,
                 "sequence_contrastive_loss_weight": 1.0,
                 "teacher_path_root": None,
+            },
+            "evaluation": {
+                "deep_decode": "unconstrained",
+                "pool_size": 1,
+                "band_radius_frames": None,
+            },
+        }
+
+        _validate_headline_claim_config(config)
+
+    def test_headline_claim_config_accepts_stage1_v2_sampling(self):
+        from dis_alignment.model.train import _validate_headline_claim_config
+
+        config = {
+            "claim": {"name": "initial_audio_only_unconstrained", "headline": True},
+            "dataset": {"segment_sampling": "self_audio_ordered"},
+            "training": {
+                "selection_metric": "val_loss",
+                "track_debug_checkpoints": False,
+                "anchor_loss_weight": 0.0,
+                "dense_anchor_loss_weight": 0.0,
+                "teacher_path_root": None,
+                "temporal_order_loss_weight": 0.4,
+                "relative_offset_loss_weight": 0.4,
+                "hard_negative_loss_weight": 0.3,
             },
             "evaluation": {
                 "deep_decode": "unconstrained",

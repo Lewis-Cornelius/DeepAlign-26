@@ -30,6 +30,7 @@ SEGMENT_SAMPLING_MODES = (
     "independent_random",
     "teacher_path",
     "self_audio",
+    "self_audio_ordered",
     "same_lied_pair",
     "self_mined_path",
 )
@@ -96,6 +97,9 @@ class SWDPairDataset(Dataset):
         self_mined_path_root: str | Path | None = None,
         num_teacher_samples: int = 64,
         teacher_min_confidence: float = 0.0,
+        relative_offset_bins: list[int] | tuple[int, ...] | None = None,
+        hard_negative_radius_frames: int = 96,
+        masked_reconstruction_prob: float = 0.15,
     ):
         if pairs is None:
             if swd is None:
@@ -119,6 +123,9 @@ class SWDPairDataset(Dataset):
         self.self_mined_path_root = Path(self_mined_path_root) if self_mined_path_root is not None else None
         self.num_teacher_samples = max(0, int(num_teacher_samples))
         self.teacher_min_confidence = float(teacher_min_confidence)
+        self.relative_offset_bins = tuple(sorted(int(value) for value in (relative_offset_bins or (8, 24, 64, 128))))
+        self.hard_negative_radius_frames = max(1, int(hard_negative_radius_frames))
+        self.masked_reconstruction_prob = float(np.clip(masked_reconstruction_prob, 0.0, 1.0))
         self._teacher_cache: dict[str, TeacherPath | None] = {}
         self._self_mined_cache: dict[str, TeacherPath | None] = {}
 
@@ -181,6 +188,14 @@ class SWDPairDataset(Dataset):
         teacher_window = None
         spec_a: NDArray[np.float32] | None = None
         spec_b: NDArray[np.float32] | None = None
+        spec_neg: NDArray[np.float32] | None = None
+        audio_neg: NDArray[np.floating] | None = None
+        temporal_order_label: int | None = None
+        relative_offset_label: int | None = None
+        relative_offset_frames: int | None = None
+        anchor_start_sample: int | None = None
+        positive_start_sample: int | None = None
+        hard_negative_start_sample: int | None = None
         if self.segment_sampling == "aligned_measures":
             window = self._select_aligned_window(pair)
             if window is not None and self._spectrogram_cache is not None:
@@ -279,6 +294,22 @@ class SWDPairDataset(Dataset):
             audio = self._maybe_crop(audio)
             audio_a = np.asarray(audio, dtype=np.float32).copy()
             audio_b = np.asarray(audio, dtype=np.float32).copy()
+        elif self.segment_sampling == "self_audio_ordered":
+            piece = pair.piece_a
+            if not self.deterministic and self._rng.random() >= 0.5:
+                piece = pair.piece_b
+            audio, _ = load_swd_audio(piece, sr=self.sr)
+            (
+                audio_a,
+                audio_b,
+                audio_neg,
+                temporal_order_label,
+                relative_offset_label,
+                relative_offset_frames,
+                anchor_start_sample,
+                positive_start_sample,
+                hard_negative_start_sample,
+            ) = self._ordered_self_audio_crops(audio)
         else:
             audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
             audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
@@ -289,9 +320,19 @@ class SWDPairDataset(Dataset):
             if self.augmentor is not None:
                 audio_a = self._augment_audio(audio_a)
                 audio_b = self._augment_audio(audio_b)
+                if audio_neg is not None:
+                    audio_neg = self._augment_audio(audio_neg)
 
             spec_a = self._compute_cqt(audio_a)
             spec_b = self._compute_cqt(audio_b)
+            if audio_neg is not None:
+                spec_neg = self._compute_cqt(audio_neg)
+
+        reconstruction_target_a: NDArray[np.float32] | None = None
+        reconstruction_mask_a: NDArray[np.float32] | None = None
+        if self.segment_sampling == "self_audio_ordered":
+            reconstruction_target_a = np.asarray(spec_a, dtype=np.float32).copy()
+            spec_a, reconstruction_mask_a = self._mask_reconstruction_frames(spec_a)
 
         sample: dict[str, Any] = {
             "spec_a": torch.from_numpy(spec_a).float().unsqueeze(0),
@@ -368,6 +409,33 @@ class SWDPairDataset(Dataset):
                     "teacher_frame_indices_a": [],
                     "teacher_frame_indices_b": [],
                     "positive_pair": True,
+                }
+            )
+        elif self.segment_sampling == "self_audio_ordered":
+            frames_a, frames_b = self._raw_offset_frames_for_specs(
+                spec_a.shape[1],
+                spec_b.shape[1],
+                start_a_sample=int(anchor_start_sample or 0),
+                start_b_sample=int(positive_start_sample or 0),
+            )
+            sample.update(
+                {
+                    "spec_neg": torch.from_numpy(spec_neg).float().unsqueeze(0),
+                    "teacher_frame_indices_a": frames_a,
+                    "teacher_frame_indices_b": frames_b,
+                    "anchor_frame_indices_a": [],
+                    "anchor_frame_indices_b": [],
+                    "temporal_order_label": int(temporal_order_label if temporal_order_label is not None else 1),
+                    "relative_offset_label": int(relative_offset_label if relative_offset_label is not None else 0),
+                    "relative_offset_frames": int(relative_offset_frames if relative_offset_frames is not None else 0),
+                    "hard_negative_radius_frames": self.hard_negative_radius_frames,
+                    "anchor_start_sample": int(anchor_start_sample if anchor_start_sample is not None else 0),
+                    "positive_start_sample": int(positive_start_sample if positive_start_sample is not None else 0),
+                    "hard_negative_start_sample": int(
+                        hard_negative_start_sample if hard_negative_start_sample is not None else 0
+                    ),
+                    "reconstruction_target_a": torch.from_numpy(reconstruction_target_a).float().unsqueeze(0),
+                    "reconstruction_mask_a": torch.from_numpy(reconstruction_mask_a).float().unsqueeze(0),
                 }
             )
         elif self.segment_sampling == "self_audio":
@@ -473,6 +541,10 @@ class SWDPairDataset(Dataset):
             & (path.time_b_s >= start_b_s)
             & (path.time_b_s <= end_b_s)
         )
+        if path.confidence is not None:
+            confidence = np.asarray(path.confidence, dtype=np.float32)
+            if confidence.shape[0] == mask.shape[0]:
+                mask &= confidence >= self.teacher_min_confidence
         available = np.flatnonzero(mask)
         if available.size < 2:
             return [], []
@@ -532,6 +604,161 @@ class SWDPairDataset(Dataset):
             frames = np.sort(self._rng.choice(n_frames, size=n_samples, replace=False))
         values = frames.astype(int).tolist()
         return values, list(values)
+
+    def _ordered_self_audio_crops(
+        self,
+        audio: NDArray[np.floating],
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], int, int, int, int, int, int]:
+        """Sample an anchor/positive crop and one nearby ordered hard negative."""
+        waveform = np.asarray(audio, dtype=np.float32)
+        if waveform.size == 0:
+            waveform = np.zeros(1, dtype=np.float32)
+        if len(waveform) <= self.max_samples:
+            crop = waveform.copy()
+            return crop, crop.copy(), crop.copy(), 1, 0, 0, 0, 0, 0
+
+        max_start = len(waveform) - self.max_samples
+        anchor_start = max_start // 2 if self.deterministic else int(self._rng.integers(0, max_start + 1))
+        positive_start = self._shifted_positive_start(anchor_start, max_start=max_start)
+
+        radius_samples = max(self.hop_length, self.hard_negative_radius_frames * self.hop_length)
+        radius_samples = min(radius_samples, max_start)
+        same_tolerance = max(1, min(radius_samples // 4, self.max_samples // 4))
+
+        requested_label = 2 if self.deterministic else int(self._rng.integers(0, 3))
+        if requested_label == 1:
+            jitter = 0 if self.deterministic else int(self._rng.integers(-same_tolerance, same_tolerance + 1))
+            negative_start = anchor_start + jitter
+        else:
+            min_offset = max(1, min(same_tolerance + 1, radius_samples))
+            max_offset = max(min_offset, radius_samples)
+            offset = min_offset if self.deterministic else int(self._rng.integers(min_offset, max_offset + 1))
+            negative_start = anchor_start - offset if requested_label == 0 else anchor_start + offset
+            if negative_start < 0:
+                negative_start = anchor_start + offset
+            if negative_start > max_start:
+                negative_start = anchor_start - offset
+
+        negative_start = int(np.clip(negative_start, 0, max_start))
+        offset_frames = int(round(abs(negative_start - anchor_start) / max(1, self.hop_length)))
+        if offset_frames <= max(1, same_tolerance // max(1, self.hop_length)):
+            order_label = 1
+        elif negative_start < anchor_start:
+            order_label = 0
+        else:
+            order_label = 2
+
+        anchor = self._crop_audio_start_sample(waveform, anchor_start)
+        positive = self._crop_audio_start_sample(waveform, positive_start)
+        negative = self._crop_audio_start_sample(waveform, negative_start)
+        return (
+            anchor.astype(np.float32, copy=False),
+            positive.astype(np.float32, copy=False),
+            negative.astype(np.float32, copy=False),
+            order_label,
+            self._relative_offset_bin(offset_frames),
+            offset_frames,
+            anchor_start,
+            positive_start,
+            negative_start,
+        )
+
+    def _shifted_positive_start(self, anchor_start: int, *, max_start: int) -> int:
+        """Choose a small raw-time shift for same-recording positive crops."""
+        if max_start <= 0:
+            return anchor_start
+        positive_radius_frames = max(1, min(12, self.hard_negative_radius_frames // 4))
+        radius_samples = min(max_start, positive_radius_frames * self.hop_length)
+        if radius_samples <= 0:
+            return anchor_start
+
+        if self.deterministic:
+            shift = min(radius_samples, max_start - anchor_start)
+            if shift == 0:
+                shift = -min(radius_samples, anchor_start)
+        else:
+            shift = 0
+            for _ in range(8):
+                shift = int(self._rng.integers(-radius_samples, radius_samples + 1))
+                if abs(shift) >= self.hop_length:
+                    break
+            if abs(shift) < self.hop_length:
+                shift = self.hop_length if anchor_start + self.hop_length <= max_start else -self.hop_length
+
+        shifted = int(np.clip(anchor_start + shift, 0, max_start))
+        if shifted == anchor_start and max_start > 0:
+            if anchor_start + self.hop_length <= max_start:
+                shifted = anchor_start + self.hop_length
+            elif anchor_start - self.hop_length >= 0:
+                shifted = anchor_start - self.hop_length
+        return int(np.clip(shifted, 0, max_start))
+
+    def _crop_audio_start_sample(
+        self,
+        audio: NDArray[np.floating],
+        start_sample: int,
+    ) -> NDArray[np.floating]:
+        if len(audio) <= self.max_samples:
+            return audio
+        max_start = max(0, len(audio) - self.max_samples)
+        start = int(np.clip(start_sample, 0, max_start))
+        return audio[start : start + self.max_samples]
+
+    def _relative_offset_bin(self, offset_frames: int) -> int:
+        """Return a coarse offset bin using raw audio frame distances only."""
+        boundaries = np.asarray(self.relative_offset_bins, dtype=np.int64)
+        return int(np.searchsorted(boundaries, int(offset_frames), side="right"))
+
+    def _raw_offset_frames_for_specs(
+        self,
+        n_frames_a: int,
+        n_frames_b: int,
+        *,
+        start_a_sample: int,
+        start_b_sample: int,
+    ) -> tuple[list[int], list[int]]:
+        """Known overlap correspondences for same-recording shifted crops."""
+        n_frames_a = int(n_frames_a)
+        n_frames_b = int(n_frames_b)
+        if n_frames_a <= 0 or n_frames_b <= 0 or self.num_teacher_samples <= 0:
+            return [], []
+
+        offset_b = int(round((start_a_sample - start_b_sample) / max(1, self.hop_length)))
+        frames_a = np.arange(n_frames_a, dtype=np.int64)
+        frames_b = frames_a + offset_b
+        valid = (frames_b >= 0) & (frames_b < n_frames_b)
+        frames_a = frames_a[valid]
+        frames_b = frames_b[valid]
+        if frames_a.size == 0:
+            return self._identity_frames_for_specs(n_frames_a, n_frames_b)
+
+        n_samples = min(frames_a.size, self.num_teacher_samples)
+        if self.deterministic or frames_a.size <= n_samples:
+            positions = np.linspace(0, frames_a.size - 1, n_samples, dtype=int)
+        else:
+            positions = np.sort(self._rng.choice(frames_a.size, size=n_samples, replace=False))
+        return frames_a[positions].astype(int).tolist(), frames_b[positions].astype(int).tolist()
+
+    def _mask_reconstruction_frames(
+        self,
+        spec: NDArray[np.float32],
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Mask time frames for the training-only CQT reconstruction head."""
+        masked = np.asarray(spec, dtype=np.float32).copy()
+        mask = np.zeros_like(masked, dtype=np.float32)
+        if masked.shape[-1] == 0 or self.masked_reconstruction_prob <= 0:
+            return masked, mask
+
+        if self.deterministic:
+            frame_mask = np.zeros(masked.shape[-1], dtype=bool)
+            frame_mask[masked.shape[-1] // 2] = True
+        else:
+            frame_mask = self._rng.random(masked.shape[-1]) < self.masked_reconstruction_prob
+            if not frame_mask.any():
+                frame_mask[int(self._rng.integers(0, masked.shape[-1]))] = True
+        mask[:, frame_mask] = 1.0
+        masked[mask > 0] = 0.0
+        return masked, mask
 
     def _select_aligned_window(self, pair: SWDPair) -> AlignedMeasureWindow | None:
         windows = self._windows_by_pair_id.get(pair.pair_id, [])
@@ -755,9 +982,16 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
 
     specs_a = []
     specs_b = []
+    specs_neg = []
+    reconstruction_targets_a = []
+    reconstruction_masks_a = []
     lengths_a = []
     lengths_b = []
+    lengths_neg = []
     pair_ids = []
+    has_neg = any("spec_neg" in item for item in batch)
+    has_reconstruction = any("reconstruction_target_a" in item for item in batch)
+    max_len_neg = max((item["spec_neg"].shape[-1] for item in batch if "spec_neg" in item), default=0)
 
     for item in batch:
         sa = item["spec_a"]
@@ -777,6 +1011,29 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
         lengths_b.append(item["spec_b"].shape[-1])
         pair_ids.append(item["pair_id"])
 
+        if has_neg:
+            sn = item.get("spec_neg")
+            if sn is None:
+                sn = torch.zeros_like(item["spec_a"])
+            pad_neg = max_len_neg - sn.shape[-1]
+            if pad_neg > 0:
+                sn = torch.nn.functional.pad(sn, (0, pad_neg))
+            specs_neg.append(sn)
+            lengths_neg.append(int(item.get("spec_neg", item["spec_a"]).shape[-1]))
+
+        if has_reconstruction:
+            target = item.get("reconstruction_target_a")
+            mask = item.get("reconstruction_mask_a")
+            if target is None:
+                target = torch.zeros_like(item["spec_a"])
+            if mask is None:
+                mask = torch.zeros_like(item["spec_a"])
+            if pad_a > 0:
+                target = torch.nn.functional.pad(target, (0, pad_a))
+                mask = torch.nn.functional.pad(mask, (0, pad_a))
+            reconstruction_targets_a.append(target)
+            reconstruction_masks_a.append(mask)
+
     collated: dict[str, Any] = {
         "spec_a": torch.stack(specs_a),
         "spec_b": torch.stack(specs_b),
@@ -784,12 +1041,26 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
         "lengths_b": torch.tensor(lengths_b),
         "pair_ids": pair_ids,
     }
+    if has_neg:
+        collated["spec_neg"] = torch.stack(specs_neg)
+        collated["lengths_neg"] = torch.tensor(lengths_neg)
+    if has_reconstruction:
+        collated["reconstruction_target_a"] = torch.stack(reconstruction_targets_a)
+        collated["reconstruction_mask_a"] = torch.stack(reconstruction_masks_a)
 
     extra_keys = {
         key
         for item in batch
         for key in item
-        if key not in {"spec_a", "spec_b", "pair_id"}
+        if key
+        not in {
+            "spec_a",
+            "spec_b",
+            "spec_neg",
+            "reconstruction_target_a",
+            "reconstruction_mask_a",
+            "pair_id",
+        }
     }
     for key in sorted(extra_keys):
         values = [item.get(key) for item in batch]

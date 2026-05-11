@@ -432,6 +432,8 @@ def mine_pseudo_teacher_paths(
 @click.option("--hop-length", type=int, default=110, help="DeepAlign feature hop length used for mining")
 @click.option("--pool-size", type=int, default=1, help="Optional feature pooling before DTW")
 @click.option("--deep-distance", type=click.Choice(["cosine", "sqeuclidean"]), default="sqeuclidean")
+@click.option("--confidence-local-radius", type=int, default=12, help="Local off-path radius for self-mined confidence")
+@click.option("--confidence-margin-scale", type=float, default=0.25, help="Margin scale for self-mined confidence sigmoid")
 @click.option("--device", type=str, default=None)
 @click.option("--cache-root", type=click.Path(), default=None, help="Directory for cached mining CQTs")
 @click.option("--performance", "performances", multiple=True, help="Limit to one or more performance ids")
@@ -445,6 +447,8 @@ def mine_self_paths(
     hop_length: int,
     pool_size: int,
     deep_distance: str,
+    confidence_local_radius: int,
+    confidence_margin_scale: float,
     device: str | None,
     cache_root: str | None,
     performances: tuple[str, ...],
@@ -507,6 +511,14 @@ def mine_self_paths(
         pooled_a = temporal_pool(features_a, pool_size=pool_size)
         pooled_b = temporal_pool(features_b, pool_size=pool_size)
         path, _, _ = fast_dtw_align(pooled_a, pooled_b, distance=deep_distance)
+        confidence = _self_mined_path_confidence(
+            pooled_a,
+            pooled_b,
+            path,
+            distance=deep_distance,
+            local_radius=confidence_local_radius,
+            margin_scale=confidence_margin_scale,
+        )
         frame_duration = hop_length * max(1, int(pool_size)) / sr
         teacher_path = TeacherPath(
             pair_id=pair.pair_id,
@@ -519,7 +531,7 @@ def mine_self_paths(
             time_a_s=path[0].astype(np.float64) * frame_duration,
             time_b_s=path[1].astype(np.float64) * frame_duration,
             anchor_calibrated=False,
-            confidence=np.ones(path.shape[1], dtype=np.float32),
+            confidence=confidence,
         )
         path_file = save_teacher_path(teacher_path, paths_dir)
         row = evaluate_teacher_path(pair, teacher_path, method="deepalign_self_mined_path")
@@ -536,6 +548,8 @@ def mine_self_paths(
                 "pool_size": int(pool_size),
                 "deep_distance": deep_distance,
                 "points": int(path.shape[1]),
+                "mean_confidence": float(np.mean(confidence)) if confidence.size else 0.0,
+                "high_confidence_points": int(np.sum(confidence >= 0.6)),
             }
         )
 
@@ -553,6 +567,66 @@ def mine_self_paths(
         f"MAE={summary['mae'] * 1000:.3f} ms, "
         f"AR@50={summary['ar_50ms'] * 100:.3f}%"
     )
+
+
+def _self_mined_path_confidence(
+    features_a,
+    features_b,
+    path,
+    *,
+    distance: str,
+    local_radius: int = 12,
+    margin_scale: float = 0.25,
+):
+    """Estimate confidence from local learned-feature margin around each mined match."""
+    import numpy as np
+
+    path = np.asarray(path, dtype=np.int64)
+    if path.size == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    x = np.asarray(features_a.T, dtype=np.float32)
+    y = np.asarray(features_b.T, dtype=np.float32)
+    if distance == "cosine":
+        x = _row_l2_normalize(x)
+        y = _row_l2_normalize(y)
+
+    radius = max(1, int(local_radius))
+    margin_scale = max(float(margin_scale), 1e-6)
+    confidences = np.zeros(path.shape[1], dtype=np.float32)
+    for col, (idx_a, idx_b) in enumerate(path.T):
+        idx_a = int(np.clip(idx_a, 0, x.shape[0] - 1))
+        idx_b = int(np.clip(idx_b, 0, y.shape[0] - 1))
+        start_b = max(0, idx_b - radius)
+        end_b = min(y.shape[0], idx_b + radius + 1)
+        candidates = y[start_b:end_b]
+        if candidates.shape[0] <= 1:
+            confidences[col] = 0.5
+            continue
+        costs = _row_costs(x[idx_a], candidates, distance=distance)
+        match_pos = idx_b - start_b
+        match_cost = float(costs[match_pos])
+        costs[match_pos] = np.inf
+        alt_cost = float(np.min(costs))
+        margin = alt_cost - match_cost
+        confidences[col] = 1.0 / (1.0 + np.exp(-(margin / margin_scale)))
+    return confidences.astype(np.float32, copy=False)
+
+
+def _row_l2_normalize(matrix):
+    import numpy as np
+
+    norm = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.maximum(norm, 1e-8)
+
+
+def _row_costs(query, candidates, *, distance: str):
+    import numpy as np
+
+    if distance == "cosine":
+        return 1.0 - (candidates @ query)
+    diff = candidates - query[None, :]
+    return np.einsum("ij,ij->i", diff, diff)
 
 
 @main.command()
@@ -575,7 +649,15 @@ def mine_self_paths(
 )
 @click.option(
     "--segment-sampling",
-    type=click.Choice(["aligned_measures", "independent_random", "teacher_path", "self_audio", "same_lied_pair", "self_mined_path"]),
+    type=click.Choice([
+        "aligned_measures",
+        "independent_random",
+        "teacher_path",
+        "self_audio",
+        "self_audio_ordered",
+        "same_lied_pair",
+        "self_mined_path",
+    ]),
     default=None,
     help="Segment sampling strategy for SWD training pairs",
 )
@@ -598,6 +680,17 @@ def mine_self_paths(
 @click.option("--sequence-contrastive-loss-weight", type=float, default=None, help="Same-lied sequence contrastive loss weight")
 @click.option("--anti-collapse-loss-weight", type=float, default=None, help="Embedding anti-collapse regularization weight")
 @click.option("--anti-collapse-covariance-weight", type=float, default=None, help="Covariance term inside anti-collapse regularization")
+@click.option("--temporal-order-loss-weight", type=float, default=None, help="Stage 1 v2 before/same/after order loss weight")
+@click.option("--relative-offset-loss-weight", type=float, default=None, help="Stage 1 v2 coarse relative-offset loss weight")
+@click.option("--relative-offset-bins", type=int, multiple=True, default=None, help="Frame-distance bin edges for relative-offset prediction")
+@click.option("--masked-reconstruction-loss-weight", type=float, default=None, help="Training-only masked-CQT reconstruction weight")
+@click.option("--cycle-consistency-loss-weight", type=float, default=None, help="Stage 2 soft A-B-A cycle loss weight")
+@click.option("--cycle-entropy-loss-weight", type=float, default=None, help="Stage 2 soft alignment entropy/sharpness weight")
+@click.option("--cycle-monotonicity-loss-weight", type=float, default=None, help="Stage 2 expected-position monotonicity weight")
+@click.option("--cycle-smoothness-loss-weight", type=float, default=None, help="Stage 2 expected-path smoothness weight")
+@click.option("--hard-negative-loss-weight", type=float, default=None, help="Stage 1 v2 nearby same-recording hard-negative weight")
+@click.option("--hard-negative-radius-frames", type=int, default=None, help="Maximum radius for strict same-audio hard negatives")
+@click.option("--memory-bank-size", type=int, default=None, help="Reserved strict SSL memory-bank size")
 @click.option("--teacher-path-root", type=click.Path(), default=None, help="Directory containing teacher path NPZ files")
 @click.option("--self-mined-path-root", type=click.Path(), default=None, help="Directory containing model self-mined path NPZ files")
 @click.option("--num-anchor-samples", type=int, default=None, help="Teacher path samples per aligned crop")
@@ -646,6 +739,17 @@ def train(
     sequence_contrastive_loss_weight: float | None,
     anti_collapse_loss_weight: float | None,
     anti_collapse_covariance_weight: float | None,
+    temporal_order_loss_weight: float | None,
+    relative_offset_loss_weight: float | None,
+    relative_offset_bins: tuple[int, ...] | None,
+    masked_reconstruction_loss_weight: float | None,
+    cycle_consistency_loss_weight: float | None,
+    cycle_entropy_loss_weight: float | None,
+    cycle_monotonicity_loss_weight: float | None,
+    cycle_smoothness_loss_weight: float | None,
+    hard_negative_loss_weight: float | None,
+    hard_negative_radius_frames: int | None,
+    memory_bank_size: int | None,
     teacher_path_root: str | None,
     self_mined_path_root: str | None,
     num_anchor_samples: int | None,
@@ -737,6 +841,29 @@ def train(
         sequence_contrastive_loss_weight=_coalesce(sequence_contrastive_loss_weight, training_cfg.get("sequence_contrastive_loss_weight"), 0.0),
         anti_collapse_loss_weight=_coalesce(anti_collapse_loss_weight, training_cfg.get("anti_collapse_loss_weight"), 0.0),
         anti_collapse_covariance_weight=_coalesce(anti_collapse_covariance_weight, training_cfg.get("anti_collapse_covariance_weight"), 0.01),
+        temporal_order_loss_weight=_coalesce(temporal_order_loss_weight, training_cfg.get("temporal_order_loss_weight"), 0.0),
+        relative_offset_loss_weight=_coalesce(relative_offset_loss_weight, training_cfg.get("relative_offset_loss_weight"), 0.0),
+        relative_offset_bins=list(relative_offset_bins) if relative_offset_bins else training_cfg.get("relative_offset_bins"),
+        masked_reconstruction_loss_weight=_coalesce(
+            masked_reconstruction_loss_weight,
+            training_cfg.get("masked_reconstruction_loss_weight"),
+            0.0,
+        ),
+        cycle_consistency_loss_weight=_coalesce(cycle_consistency_loss_weight, training_cfg.get("cycle_consistency_loss_weight"), 0.0),
+        cycle_entropy_loss_weight=_coalesce(cycle_entropy_loss_weight, training_cfg.get("cycle_entropy_loss_weight"), 0.0),
+        cycle_monotonicity_loss_weight=_coalesce(
+            cycle_monotonicity_loss_weight,
+            training_cfg.get("cycle_monotonicity_loss_weight"),
+            0.0,
+        ),
+        cycle_smoothness_loss_weight=_coalesce(
+            cycle_smoothness_loss_weight,
+            training_cfg.get("cycle_smoothness_loss_weight"),
+            0.0,
+        ),
+        hard_negative_loss_weight=_coalesce(hard_negative_loss_weight, training_cfg.get("hard_negative_loss_weight"), 0.0),
+        hard_negative_radius_frames=_coalesce(hard_negative_radius_frames, training_cfg.get("hard_negative_radius_frames"), 96),
+        memory_bank_size=_coalesce(memory_bank_size, training_cfg.get("memory_bank_size"), 0),
         teacher_path_root=_coalesce(teacher_path_root, training_cfg.get("teacher_path_root"), None),
         self_mined_path_root=_coalesce(self_mined_path_root, training_cfg.get("self_mined_path_root"), None),
         num_anchor_samples=_coalesce(num_anchor_samples, training_cfg.get("num_anchor_samples"), 64),
