@@ -1,0 +1,91 @@
+# Strict headline Stage 1 v2: same-audio multi-view SSL with local timing tasks.
+#
+# Uses only SWD audio and raw within-recording time indices. No teacher paths,
+# score, transcription, measure anchors, guided bands, or external audio.
+
+claim:
+  name: initial_audio_only_unconstrained
+  headline: true
+
+dataset:
+  swd_path: null
+  max_length_sec: 4.0
+  segment_sampling: self_audio_ordered
+  samples_per_epoch: 256
+  cache_spectrograms: false
+  cache_root: .cache/cqt
+  debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
+  val_split: 0.2
+  performances: null
+
+audio:
+  sr: 22050
+  hop_length: 110
+  n_bins: 84
+  bins_per_octave: 12
+
+model:
+  embed_dim: 64
+  conv_channels: [32, 64, 128, 128]
+  gru_hidden_size: 128
+  num_gru_layers: 2
+  dropout: 0.1
+  temporal_attention_heads: 0
+
+training:
+  epochs: 16
+  batch_size: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  resume_from: checkpoints/initial_claim_self_audio_pretrain/best_model.pt
+  selection_metric: val_loss
+  track_debug_checkpoints: false
+  anchor_loss_weight: 0.0
+  dense_anchor_loss_weight: 0.0
+  path_distill_loss_weight: 0.5
+  sequence_contrastive_loss_weight: 0.0
+  anti_collapse_loss_weight: 0.05
+  anti_collapse_covariance_weight: 0.01
+  temporal_order_loss_weight: 0.4
+  relative_offset_loss_weight: 0.4
+  relative_offset_bins: [8, 24, 64, 128]
+  masked_reconstruction_loss_weight: 0.05
+  cycle_consistency_loss_weight: 0.0
+  cycle_entropy_loss_weight: 0.0
+  cycle_monotonicity_loss_weight: 0.0
+  hard_negative_loss_weight: 0.35
+  hard_negative_radius_frames: 128
+  memory_bank_size: 0
+  teacher_path_root: null
+  self_mined_path_root: null
+  teacher_min_confidence: 0.0
+  num_anchor_samples: 192
+  disable_time_stretch_for_anchors: true
+  anchor_temperature: 0.05
+  anchor_min_anchor_gap: 3
+
+soft_dtw:
+  loss_weight: 0.0
+  start_gamma: 0.1
+  end_gamma: 0.01
+  normalize: true
+  dist_func: sqeuclidean
+
+augmentation:
+  enabled: true
+  time_stretch_range: [1.0, 1.0]
+  pitch_shift_range: [-2, 2]
+  noise_snr_range: [15.0, 40.0]
+  augment_prob: 0.8
+
+evaluation:
+  deep_decode: unconstrained
+  deep_distance: sqeuclidean
+  pool_size: 1
+  band_radius_frames: null
+  alignment_eval_every_n_epochs: 0
+
+output:
+  checkpoint_dir: checkpoints/initial_claim_strict_ssl_stage1_v2
+  save_every_n_epochs: 1

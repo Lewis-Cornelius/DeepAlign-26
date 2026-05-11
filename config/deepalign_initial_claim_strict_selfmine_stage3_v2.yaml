@@ -1,0 +1,91 @@
+# Strict headline Stage 3 v2: learned self-mined refinement.
+#
+# Run only after Stage 2 improves the 8-lied gate. Mined paths must come from
+# the learned DeepAlign checkpoint itself, not from chroma/score/anchors.
+
+claim:
+  name: initial_audio_only_unconstrained
+  headline: true
+
+dataset:
+  swd_path: null
+  max_length_sec: 4.0
+  segment_sampling: self_mined_path
+  samples_per_epoch: 160
+  cache_spectrograms: true
+  cache_root: .cache/cqt
+  debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
+  val_split: 0.2
+  performances: null
+
+audio:
+  sr: 22050
+  hop_length: 110
+  n_bins: 84
+  bins_per_octave: 12
+
+model:
+  embed_dim: 64
+  conv_channels: [32, 64, 128, 128]
+  gru_hidden_size: 128
+  num_gru_layers: 2
+  dropout: 0.1
+  temporal_attention_heads: 0
+
+training:
+  epochs: 16
+  batch_size: 3
+  lr: 0.00003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  resume_from: checkpoints/initial_claim_strict_cycle_stage2/best_model.pt
+  selection_metric: val_loss
+  track_debug_checkpoints: false
+  anchor_loss_weight: 0.0
+  dense_anchor_loss_weight: 0.0
+  path_distill_loss_weight: 0.5
+  sequence_contrastive_loss_weight: 0.4
+  anti_collapse_loss_weight: 0.05
+  anti_collapse_covariance_weight: 0.01
+  temporal_order_loss_weight: 0.0
+  relative_offset_loss_weight: 0.0
+  relative_offset_bins: [8, 24, 64, 128]
+  masked_reconstruction_loss_weight: 0.0
+  cycle_consistency_loss_weight: 0.2
+  cycle_entropy_loss_weight: 0.01
+  cycle_monotonicity_loss_weight: 0.03
+  hard_negative_loss_weight: 0.0
+  hard_negative_radius_frames: 128
+  memory_bank_size: 0
+  teacher_path_root: null
+  self_mined_path_root: results/self_mined_initial_claim_strict_cycle_stage2/paths
+  teacher_min_confidence: 0.0
+  num_anchor_samples: 128
+  disable_time_stretch_for_anchors: true
+  anchor_temperature: 0.07
+  anchor_min_anchor_gap: 3
+
+soft_dtw:
+  loss_weight: 0.0
+  start_gamma: 0.08
+  end_gamma: 0.02
+  normalize: true
+  dist_func: sqeuclidean
+
+augmentation:
+  enabled: true
+  time_stretch_range: [1.0, 1.0]
+  pitch_shift_range: [-1, 1]
+  noise_snr_range: [25.0, 45.0]
+  augment_prob: 0.35
+
+evaluation:
+  deep_decode: unconstrained
+  deep_distance: sqeuclidean
+  pool_size: 1
+  band_radius_frames: null
+  alignment_eval_every_n_epochs: 0
+
+output:
+  checkpoint_dir: checkpoints/initial_claim_strict_selfmine_stage3_v2
+  save_every_n_epochs: 1
