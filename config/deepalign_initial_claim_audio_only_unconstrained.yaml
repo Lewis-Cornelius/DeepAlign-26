@@ -1,0 +1,77 @@
+# Initial-claim recovery: audio-only DeepAlign with unconstrained DTW.
+#
+# Headline-eligible constraints:
+# - no score, transcription, chroma-guided, diagonal-band, or GT-anchor decoder
+# - no SWD measure-anchor crop sampling or anchor loss in training
+# - teacher paths must be generated from audio-only features, not anchor-calibrated
+
+claim:
+  name: initial_audio_only_unconstrained
+  headline: true
+
+dataset:
+  swd_path: null
+  max_length_sec: 12.0
+  segment_sampling: teacher_path
+  samples_per_epoch: 384
+  cache_spectrograms: true
+  cache_root: .cache/cqt
+  debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
+  val_split: 0.2
+  performances: null
+
+audio:
+  sr: 22050
+  hop_length: 110
+  n_bins: 84
+  bins_per_octave: 12
+
+model:
+  embed_dim: 64
+  conv_channels: [32, 64, 128, 128]
+  gru_hidden_size: 128
+  num_gru_layers: 2
+  dropout: 0.1
+  temporal_attention_heads: 0
+
+training:
+  epochs: 36
+  batch_size: 3
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  resume_from: checkpoints/initial_claim_self_audio_pretrain/best_model.pt
+  selection_metric: debug_ar50
+  anchor_loss_weight: 0.0
+  dense_anchor_loss_weight: 0.0
+  path_distill_loss_weight: 1.0
+  teacher_path_root: results/teacher_initial_claim_audio_only/paths
+  teacher_min_confidence: 0.60
+  num_anchor_samples: 128
+  disable_time_stretch_for_anchors: true
+  anchor_temperature: 0.05
+  anchor_min_anchor_gap: 3
+
+soft_dtw:
+  loss_weight: 0.15
+  start_gamma: 0.1
+  end_gamma: 0.01
+  normalize: true
+  dist_func: sqeuclidean
+
+augmentation:
+  enabled: true
+  time_stretch_range: [1.0, 1.0]
+  pitch_shift_range: [-1, 1]
+  noise_snr_range: [25.0, 45.0]
+  augment_prob: 0.35
+
+evaluation:
+  deep_decode: unconstrained
+  deep_distance: sqeuclidean
+  pool_size: 1
+  band_radius_frames: null
+
+output:
+  checkpoint_dir: checkpoints/initial_claim_audio_only_unconstrained
+  save_every_n_epochs: 1

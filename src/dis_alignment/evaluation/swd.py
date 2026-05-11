@@ -209,6 +209,7 @@ def evaluate_swd_dataset(
     fusion_chroma_weight: float = 0.25,
     refine_window_sec: float = 8.0,
     score_refine_radius_sec: float = 0.5,
+    allow_skips: bool = False,
 ) -> pd.DataFrame:
     """Evaluate SWD pairs with the requested methods."""
     resolved_methods = parse_methods(methods, checkpoint_path=checkpoint_path)
@@ -221,44 +222,94 @@ def evaluate_swd_dataset(
     pair_iter = list(dataset.iter_pairs(performances=performances, lieder=lieder))
     iterator = tqdm(pair_iter, desc="Evaluating SWD", disable=not show_progress)
     rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
     matchmaker_cache: dict[tuple[str, str, str], tuple[pd.DataFrame, Any]] = {}
 
     for pair in iterator:
         try:
-            rows.extend(
-                evaluate_pair(
-                    pair,
-                    dataset=dataset,
-                    methods=resolved_methods,
-                    encoder=encoder,
-                    sr=sr,
-                    chroma_hop=chroma_hop,
-                    deep_hop=deep_hop,
-                    pool_size=pool_size,
-                    device=device,
-                    mrmsdtw_memory_limit_mb=mrmsdtw_memory_limit_mb,
-                    cache_root=cache_root,
-                    deep_decode=deep_decode,
-                    deep_distance=deep_distance,
-                    band_radius_frames=band_radius_frames,
-                    transcription_cache_root=transcription_cache_root,
-                    fusion_deep_weight=fusion_deep_weight,
-                    fusion_onset_weight=fusion_onset_weight,
-                    fusion_note_weight=fusion_note_weight,
-                    fusion_dlnco_weight=fusion_dlnco_weight,
-                    fusion_chroma_weight=fusion_chroma_weight,
-                    refine_window_sec=refine_window_sec,
-                    score_refine_radius_sec=score_refine_radius_sec,
-                    matchmaker_cache=matchmaker_cache,
-                    matchmaker_method=matchmaker_method,
-                    matchmaker_feature_type=matchmaker_feature_type,
-                    matchmaker_frame_rate=matchmaker_frame_rate,
-                )
+            pair_rows = evaluate_pair(
+                pair,
+                dataset=dataset,
+                methods=resolved_methods,
+                encoder=encoder,
+                sr=sr,
+                chroma_hop=chroma_hop,
+                deep_hop=deep_hop,
+                pool_size=pool_size,
+                device=device,
+                mrmsdtw_memory_limit_mb=mrmsdtw_memory_limit_mb,
+                cache_root=cache_root,
+                deep_decode=deep_decode,
+                deep_distance=deep_distance,
+                band_radius_frames=band_radius_frames,
+                transcription_cache_root=transcription_cache_root,
+                fusion_deep_weight=fusion_deep_weight,
+                fusion_onset_weight=fusion_onset_weight,
+                fusion_note_weight=fusion_note_weight,
+                fusion_dlnco_weight=fusion_dlnco_weight,
+                fusion_chroma_weight=fusion_chroma_weight,
+                refine_window_sec=refine_window_sec,
+                score_refine_radius_sec=score_refine_radius_sec,
+                matchmaker_cache=matchmaker_cache,
+                matchmaker_method=matchmaker_method,
+                matchmaker_feature_type=matchmaker_feature_type,
+                matchmaker_frame_rate=matchmaker_frame_rate,
             )
+            if not pair_rows:
+                raise RuntimeError("No evaluation rows were produced for this pair.")
+            produced_methods = {str(row.get("method")) for row in pair_rows}
+            missing_methods = [
+                method for method in resolved_methods if method not in produced_methods
+            ]
+            if missing_methods:
+                missing_exc = RuntimeError(
+                    "No rows were produced for requested methods: "
+                    + ", ".join(missing_methods)
+                )
+                if allow_skips:
+                    LOGGER.warning(
+                        "Skipping SWD methods for pair %s: %s",
+                        pair.pair_id,
+                        missing_exc,
+                    )
+                    failures.append(_build_failure_row(pair, missing_exc, methods=missing_methods))
+                    rows.extend(pair_rows)
+                    continue
+                raise missing_exc
+            rows.extend(pair_rows)
         except Exception as exc:
+            if not allow_skips:
+                raise RuntimeError(
+                    f"SWD pair {pair.pair_id} failed during evaluation: {exc}. "
+                    "Rerun with allow_skips=True only if a partial CSV is intentional."
+                ) from exc
             LOGGER.warning("Skipping SWD pair %s due to evaluation error: %s", pair.pair_id, exc)
+            failures.append(_build_failure_row(pair, exc, methods=resolved_methods))
 
-    return pd.DataFrame(rows)
+    results = pd.DataFrame(rows)
+    if failures:
+        results.attrs["failures"] = pd.DataFrame(failures)
+    return results
+
+
+def _build_failure_row(
+    pair: SWDPair,
+    exc: Exception,
+    *,
+    methods: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Return a CSV-friendly record for a skipped SWD pair."""
+    return {
+        "dataset": "swd",
+        "pair_id": pair.pair_id,
+        "group_id": pair.lied_id,
+        "piece_a_id": pair.piece_a.piece_id,
+        "piece_b_id": pair.piece_b.piece_id,
+        "methods": ",".join(methods or ()),
+        "status": "skipped",
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
 
 
 def _get_matchmaker_predictions(

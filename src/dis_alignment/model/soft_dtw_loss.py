@@ -44,17 +44,28 @@ class SoftDTWLoss(nn.Module):
         self.normalize = normalize
         self.dist_func = dist_func
 
-    def forward(self, seq_a: Tensor, seq_b: Tensor) -> Tensor:
+    def forward(
+        self,
+        seq_a: Tensor,
+        seq_b: Tensor,
+        lengths_a: Tensor | None = None,
+        lengths_b: Tensor | None = None,
+    ) -> Tensor:
         """
         Compute Soft-DTW loss between two embedding sequences.
 
         Args:
             seq_a: Embeddings of shape (batch, time_a, embed_dim).
             seq_b: Embeddings of shape (batch, time_b, embed_dim).
+            lengths_a: Optional valid lengths for seq_a before padding.
+            lengths_b: Optional valid lengths for seq_b before padding.
 
         Returns:
             Scalar loss value (mean over batch).
         """
+        if lengths_a is not None or lengths_b is not None:
+            return self._forward_with_lengths(seq_a, seq_b, lengths_a, lengths_b)
+
         # Compute pairwise distance matrix
         D = self._pairwise_distances(seq_a, seq_b)
 
@@ -70,6 +81,38 @@ class SoftDTWLoss(nn.Module):
             sdtw = sdtw - 0.5 * (sdtw_aa + sdtw_bb)
 
         return sdtw.mean()
+
+    def _forward_with_lengths(
+        self,
+        seq_a: Tensor,
+        seq_b: Tensor,
+        lengths_a: Tensor | None,
+        lengths_b: Tensor | None,
+    ) -> Tensor:
+        """Compute loss after removing padded frames from each batch item."""
+        if lengths_a is None or lengths_b is None:
+            raise ValueError("lengths_a and lengths_b must be provided together.")
+        if seq_a.shape[0] != seq_b.shape[0]:
+            raise ValueError("seq_a and seq_b must have the same batch size.")
+        if len(lengths_a) != seq_a.shape[0] or len(lengths_b) != seq_b.shape[0]:
+            raise ValueError("Length tensors must match the batch size.")
+
+        losses: list[Tensor] = []
+        for batch_idx in range(seq_a.shape[0]):
+            len_a = int(lengths_a[batch_idx].item())
+            len_b = int(lengths_b[batch_idx].item())
+            if len_a <= 0 or len_b <= 0:
+                raise ValueError("Sequence lengths must be positive.")
+            if len_a > seq_a.shape[1] or len_b > seq_b.shape[1]:
+                raise ValueError("Sequence lengths cannot exceed padded tensor lengths.")
+            losses.append(
+                self.forward(
+                    seq_a[batch_idx : batch_idx + 1, :len_a],
+                    seq_b[batch_idx : batch_idx + 1, :len_b],
+                )
+            )
+
+        return torch.stack(losses).mean()
 
     def _pairwise_distances(self, x: Tensor, y: Tensor) -> Tensor:
         """

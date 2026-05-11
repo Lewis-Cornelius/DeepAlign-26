@@ -17,7 +17,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
-from dis_alignment.model.anchor_loss import AnchorContrastiveLoss
+from dis_alignment.model.anchor_loss import AnchorContrastiveLoss, PathDistillationLoss
 from dis_alignment.model.encoder import CRNNEncoder, DeepAlignModel
 from dis_alignment.model.recovery import normalize_debug_lied_ids
 from dis_alignment.model.soft_dtw_loss import GammaScheduler, SoftDTWLoss
@@ -30,11 +30,21 @@ logger = logging.getLogger(__name__)
 
 SELECTION_METRICS = ("debug_mae", "debug_ar50", "debug_balanced", "val_loss", "val_mae")
 TRACKED_SELECTION_METRICS = ("debug_ar50", "debug_mae", "debug_balanced")
+TRAIN_DEEP_DECODE_CHOICES = (
+    "unconstrained",
+    "diagonal_band",
+    "chroma_guided_band",
+    "deepalign_transcription_fused",
+    "deepalign_transcription_fused_refined",
+    "deepalign_transcription_guided",
+    "deepalign_score_guided_refined",
+)
 BEST_CHECKPOINT_FILENAMES = {
     "debug_ar50": "best_model_debug_ar50.pt",
     "debug_mae": "best_model_debug_mae.pt",
     "debug_balanced": "best_model_balanced.pt",
 }
+HEADLINE_CLAIM_NAMES = {"initial_audio_only_unconstrained", "audio_only_unconstrained"}
 
 
 class _SyntheticPairDataset(Dataset):
@@ -71,11 +81,14 @@ def train(
     num_gru_layers: int = 2,
     dropout: float = 0.1,
     temporal_attention_heads: int = 0,
+    sr: int = 22050,
+    hop_length: int = 220,
     max_length_sec: float = 30.0,
     segment_sampling: str = "aligned_measures",
     samples_per_epoch: int | None = None,
     start_gamma: float = 1.0,
     end_gamma: float = 0.01,
+    soft_dtw_loss_weight: float = 1.0,
     normalize_loss: bool = True,
     dist_func: str = "sqeuclidean",
     gradient_clip: float = 1.0,
@@ -93,6 +106,14 @@ def train(
     deep_decode: str = "unconstrained",
     band_radius_frames: int | None = None,
     anchor_loss_weight: float = 0.0,
+    dense_anchor_loss_weight: float = 0.0,
+    path_distill_loss_weight: float = 0.0,
+    teacher_path_root: str | None = None,
+    num_anchor_samples: int = 64,
+    teacher_min_confidence: float = 0.0,
+    disable_time_stretch_for_anchors: bool = True,
+    eval_pool_size: int = 2,
+    alignment_eval_every_n_epochs: int = 1,
     anchor_temperature: float = 0.1,
     anchor_min_anchor_gap: int = 1,
     dry_run: bool = False,
@@ -123,6 +144,14 @@ def train(
     resolved_cache_root = str(Path(cache_root or ".cache/cqt").resolve()) if cache_spectrograms else None
     debug_lied_ids = normalize_debug_lied_ids(debug_subset_lieder)
     augmentor_kwargs = augmentor_kwargs or {}
+    supervised_anchor_training = (
+        anchor_loss_weight > 0
+        or dense_anchor_loss_weight > 0
+        or path_distill_loss_weight > 0
+    )
+    if augment and disable_time_stretch_for_anchors and supervised_anchor_training:
+        augmentor_kwargs = dict(augmentor_kwargs)
+        augmentor_kwargs["time_stretch_range"] = (1.0, 1.0)
     collate_fn = None
 
     history = _empty_history()
@@ -150,12 +179,19 @@ def train(
         logger.info("Available lieder: %s", len(swd.available_lieder))
 
         all_pairs = list(swd.iter_pairs())
-        train_pairs, val_pairs = _split_swd_pairs(all_pairs, val_split=val_split)
-        debug_pairs = [pair for pair in all_pairs if pair.lied_id in set(debug_lied_ids)]
+        train_pairs, val_pairs = _split_swd_pairs(
+            all_pairs,
+            val_split=val_split,
+            heldout_lieder=debug_lied_ids,
+        )
+        debug_lied_set = {str(lied_id).strip().upper() for lied_id in debug_lied_ids}
+        debug_pairs = [
+            pair for pair in val_pairs if str(pair.lied_id).strip().upper() in debug_lied_set
+        ]
         if selection_metric.startswith("debug_") and not debug_pairs:
             raise ValueError(
-                "The configured debug subset did not resolve to any SWD pairs, "
-                "so debug-based checkpoint selection cannot run."
+                "The configured debug subset did not resolve to any held-out SWD pairs, "
+                "so debug-based checkpoint selection cannot run without leakage."
             )
 
         resolved_samples_per_epoch = (
@@ -166,9 +202,10 @@ def train(
         train_augmentor = AudioAugmentor(**augmentor_kwargs) if augment else None
         train_dataset = SWDPairDataset(
             swd,
+            sr=sr,
+            hop_length=hop_length,
             max_length_sec=max_length_sec,
             augmentor=train_augmentor,
-            hop_length=220,
             n_bins=n_freq_bins,
             pairs=train_pairs,
             segment_sampling=segment_sampling,
@@ -176,12 +213,16 @@ def train(
             deterministic=False,
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
+            teacher_path_root=teacher_path_root if path_distill_loss_weight > 0 else None,
+            num_teacher_samples=num_anchor_samples,
+            teacher_min_confidence=teacher_min_confidence,
         )
         val_dataset = SWDPairDataset(
             swd,
+            sr=sr,
+            hop_length=hop_length,
             max_length_sec=max_length_sec,
             augmentor=None,
-            hop_length=220,
             n_bins=n_freq_bins,
             pairs=val_pairs,
             segment_sampling=segment_sampling,
@@ -189,6 +230,9 @@ def train(
             deterministic=True,
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
+            teacher_path_root=teacher_path_root if segment_sampling == "teacher_path" else None,
+            num_teacher_samples=num_anchor_samples,
+            teacher_min_confidence=teacher_min_confidence,
         )
         n_train = len(train_pairs)
         n_val = len(val_pairs)
@@ -232,22 +276,40 @@ def train(
     model = DeepAlignModel(encoder).to(dev)
     logger.info("Model parameters: %s", f"{sum(p.numel() for p in model.parameters()):,}")
 
-    criterion = SoftDTWLoss(
-        gamma=start_gamma,
-        normalize=normalize_loss,
-        dist_func=dist_func,
-    ).to(dev)
+    criterion = (
+        SoftDTWLoss(
+            gamma=start_gamma,
+            normalize=normalize_loss,
+            dist_func=dist_func,
+        ).to(dev)
+        if soft_dtw_loss_weight > 0
+        else None
+    )
     anchor_loss_fn = (
         AnchorContrastiveLoss(temperature=anchor_temperature, min_anchor_gap=anchor_min_anchor_gap).to(dev)
         if anchor_loss_weight > 0
         else None
     )
+    dense_anchor_loss_fn = (
+        AnchorContrastiveLoss(temperature=anchor_temperature, min_anchor_gap=anchor_min_anchor_gap).to(dev)
+        if dense_anchor_loss_weight > 0
+        else None
+    )
+    path_distill_loss_fn = (
+        PathDistillationLoss(temperature=anchor_temperature, min_anchor_gap=anchor_min_anchor_gap).to(dev)
+        if path_distill_loss_weight > 0
+        else None
+    )
 
-    gamma_scheduler = GammaScheduler(
-        criterion,
-        start_gamma=start_gamma,
-        end_gamma=end_gamma,
-        num_epochs=epochs,
+    gamma_scheduler = (
+        GammaScheduler(
+            criterion,
+            start_gamma=start_gamma,
+            end_gamma=end_gamma,
+            num_epochs=epochs,
+        )
+        if criterion is not None
+        else None
     )
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
@@ -256,10 +318,21 @@ def train(
     training_state_signature = {
         "epochs": epochs,
         "lr": lr,
+        "sr": sr,
+        "hop_length": hop_length,
         "start_gamma": start_gamma,
         "end_gamma": end_gamma,
+        "soft_dtw_loss_weight": soft_dtw_loss_weight,
         "selection_metric": selection_metric,
         "anchor_loss_weight": anchor_loss_weight,
+        "dense_anchor_loss_weight": dense_anchor_loss_weight,
+        "path_distill_loss_weight": path_distill_loss_weight,
+        "teacher_path_root": str(teacher_path_root) if teacher_path_root is not None else None,
+        "num_anchor_samples": num_anchor_samples,
+        "teacher_min_confidence": teacher_min_confidence,
+        "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
+        "eval_pool_size": eval_pool_size,
+        "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
     }
     best_selections: dict[str, dict[str, Any]] = {}
     start_epoch = 0
@@ -276,31 +349,56 @@ def train(
         )
     else:
         best_selection = None
+    history = _ensure_history_keys(history)
 
     for epoch in range(start_epoch, epochs):
         epoch_start = time.perf_counter()
-        gamma = gamma_scheduler.step(epoch)
+        gamma = gamma_scheduler.step(epoch) if gamma_scheduler is not None else start_gamma
         history["gamma"].append(gamma)
 
         model.train()
         train_loss = 0.0
+        train_soft_dtw_loss = 0.0
         train_anchor_loss = 0.0
+        train_dense_anchor_loss = 0.0
+        train_path_distill_loss = 0.0
         n_batches = 0
 
         for batch in train_loader:
             spec_a = batch["spec_a"].to(dev)
             spec_b = batch["spec_b"].to(dev)
+            lengths_a = batch.get("lengths_a")
+            lengths_b = batch.get("lengths_b")
             anchor_frames_a = batch.get("anchor_frame_indices_a")
             anchor_frames_b = batch.get("anchor_frame_indices_b")
+            teacher_frames_a = batch.get("teacher_frame_indices_a")
+            teacher_frames_b = batch.get("teacher_frame_indices_b")
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=(dev.type == "cuda")):
                 emb_a, emb_b = model(spec_a, spec_b)
-                loss = criterion(emb_a, emb_b)
+                soft_dtw_component = emb_a.new_zeros(())
+                loss = emb_a.new_zeros(())
+                if criterion is not None:
+                    soft_dtw_component = criterion(
+                        emb_a,
+                        emb_b,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                    )
+                    loss = loss + (soft_dtw_loss_weight * soft_dtw_component)
                 anchor_component = emb_a.new_zeros(())
                 if anchor_loss_fn is not None:
                     anchor_component = anchor_loss_fn(emb_a, emb_b, anchor_frames_a, anchor_frames_b)
                     loss = loss + (anchor_loss_weight * anchor_component)
+                dense_anchor_component = emb_a.new_zeros(())
+                if dense_anchor_loss_fn is not None:
+                    dense_anchor_component = dense_anchor_loss_fn(emb_a, emb_b, anchor_frames_a, anchor_frames_b)
+                    loss = loss + (dense_anchor_loss_weight * dense_anchor_component)
+                path_distill_component = emb_a.new_zeros(())
+                if path_distill_loss_fn is not None:
+                    path_distill_component = path_distill_loss_fn(emb_a, emb_b, teacher_frames_a, teacher_frames_b)
+                    loss = loss + (path_distill_loss_weight * path_distill_component)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -309,13 +407,22 @@ def train(
             scaler.update()
 
             train_loss += float(loss.item())
+            train_soft_dtw_loss += float(soft_dtw_component.item())
             train_anchor_loss += float(anchor_component.item())
+            train_dense_anchor_loss += float(dense_anchor_component.item())
+            train_path_distill_loss += float(path_distill_component.item())
             n_batches += 1
 
         train_loss /= max(n_batches, 1)
+        train_soft_dtw_loss /= max(n_batches, 1)
         train_anchor_loss /= max(n_batches, 1)
+        train_dense_anchor_loss /= max(n_batches, 1)
+        train_path_distill_loss /= max(n_batches, 1)
         history["train_loss"].append(train_loss)
+        history["train_soft_dtw_loss"].append(train_soft_dtw_loss)
         history["train_anchor_loss"].append(train_anchor_loss)
+        history["train_dense_anchor_loss"].append(train_dense_anchor_loss)
+        history["train_path_distill_loss"].append(train_path_distill_loss)
 
         model.eval()
         val_loss = 0.0
@@ -324,8 +431,32 @@ def train(
             for batch in val_loader:
                 spec_a = batch["spec_a"].to(dev)
                 spec_b = batch["spec_b"].to(dev)
+                lengths_a = batch.get("lengths_a")
+                lengths_b = batch.get("lengths_b")
                 emb_a, emb_b = model(spec_a, spec_b)
-                loss = criterion(emb_a, emb_b)
+                if criterion is not None:
+                    loss = criterion(emb_a, emb_b, lengths_a=lengths_a, lengths_b=lengths_b)
+                else:
+                    loss = emb_a.new_zeros(())
+                anchor_frames_a = batch.get("anchor_frame_indices_a")
+                anchor_frames_b = batch.get("anchor_frame_indices_b")
+                teacher_frames_a = batch.get("teacher_frame_indices_a")
+                teacher_frames_b = batch.get("teacher_frame_indices_b")
+                if anchor_loss_fn is not None:
+                    loss = loss + (
+                        anchor_loss_weight
+                        * anchor_loss_fn(emb_a, emb_b, anchor_frames_a, anchor_frames_b)
+                    )
+                if dense_anchor_loss_fn is not None:
+                    loss = loss + (
+                        dense_anchor_loss_weight
+                        * dense_anchor_loss_fn(emb_a, emb_b, anchor_frames_a, anchor_frames_b)
+                    )
+                if path_distill_loss_fn is not None:
+                    loss = loss + (
+                        path_distill_loss_weight
+                        * path_distill_loss_fn(emb_a, emb_b, teacher_frames_a, teacher_frames_b)
+                    )
                 val_loss += float(loss.item())
                 n_val_batches += 1
 
@@ -336,25 +467,37 @@ def train(
         history["lr"].append(current_lr)
         lr_scheduler.step()
 
-        if dry_run:
+        run_alignment_eval = (
+            alignment_eval_every_n_epochs > 0
+            and ((epoch + 1) % alignment_eval_every_n_epochs == 0 or epoch + 1 == epochs)
+        )
+        if dry_run or not run_alignment_eval:
             debug_metrics = {"mae": np.nan, "ar_50ms": np.nan, "ar_100ms": np.nan, "ar_200ms": np.nan, "pairs": 0.0}
             val_metrics = {"mae": np.nan, "ar_50ms": np.nan, "ar_100ms": np.nan, "ar_200ms": np.nan, "pairs": 0.0}
         else:
             debug_metrics = _evaluate_swd_pairs(
                 debug_pairs,
+                dataset=swd,
+                sr=sr,
+                hop_length=hop_length,
                 encoder=model.encoder,
                 device=device,
                 cache_root=resolved_cache_root,
                 deep_decode=deep_decode,
                 band_radius_frames=band_radius_frames,
+                pool_size=eval_pool_size,
             )
             val_metrics = _evaluate_swd_pairs(
                 val_pairs,
+                dataset=swd,
+                sr=sr,
+                hop_length=hop_length,
                 encoder=model.encoder,
                 device=device,
                 cache_root=resolved_cache_root,
                 deep_decode=deep_decode,
                 band_radius_frames=band_radius_frames,
+                pool_size=eval_pool_size,
             )
 
         history["debug_mae"].append(float(debug_metrics["mae"]))
@@ -385,12 +528,18 @@ def train(
         history["epoch_time"].append(epoch_time)
 
         logger.info(
-            "Epoch %s/%s | Train: %.4f | Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
+            "Epoch %s/%s | Train: %.4f | SoftDTW: %.4f | Anchor: %.4f | "
+            "Dense: %.4f | Distill: %.4f | "
+            "Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
             "Debug AR@100: %.4f | Val MAE: %.4f | Val AR@50: %.4f | Val AR@100: %.4f | "
             "gamma: %.4f | LR: %.2e | Time: %.1fs",
             epoch + 1,
             epochs,
             train_loss,
+            train_soft_dtw_loss,
+            train_anchor_loss,
+            train_dense_anchor_loss,
+            train_path_distill_loss,
             val_loss,
             debug_metrics["mae"],
             debug_metrics["ar_50ms"],
@@ -421,6 +570,8 @@ def train(
                 "swd_path": swd_path,
                 "embed_dim": embed_dim,
                 "n_freq_bins": n_freq_bins,
+                "sr": sr,
+                "hop_length": hop_length,
                 "num_conv_channels": num_conv_channels,
                 "gru_hidden_size": gru_hidden_size,
                 "num_gru_layers": num_gru_layers,
@@ -431,6 +582,7 @@ def train(
                 "samples_per_epoch": resolved_samples_per_epoch,
                 "start_gamma": start_gamma,
                 "end_gamma": end_gamma,
+                "soft_dtw_loss_weight": soft_dtw_loss_weight,
                 "normalize_loss": normalize_loss,
                 "dist_func": dist_func,
                 "gradient_clip": gradient_clip,
@@ -445,6 +597,14 @@ def train(
                 "deep_decode": deep_decode,
                 "band_radius_frames": band_radius_frames,
                 "anchor_loss_weight": anchor_loss_weight,
+                "dense_anchor_loss_weight": dense_anchor_loss_weight,
+                "path_distill_loss_weight": path_distill_loss_weight,
+                "teacher_path_root": teacher_path_root,
+                "num_anchor_samples": num_anchor_samples,
+                "teacher_min_confidence": teacher_min_confidence,
+                "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
+                "eval_pool_size": eval_pool_size,
+                "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
                 "anchor_temperature": anchor_temperature,
                 "anchor_min_anchor_gap": anchor_min_anchor_gap,
             },
@@ -472,6 +632,8 @@ def train(
                         "swd_path": swd_path,
                         "embed_dim": embed_dim,
                         "n_freq_bins": n_freq_bins,
+                        "sr": sr,
+                        "hop_length": hop_length,
                         "num_conv_channels": num_conv_channels,
                         "gru_hidden_size": gru_hidden_size,
                         "num_gru_layers": num_gru_layers,
@@ -482,6 +644,7 @@ def train(
                         "samples_per_epoch": resolved_samples_per_epoch,
                         "start_gamma": start_gamma,
                         "end_gamma": end_gamma,
+                        "soft_dtw_loss_weight": soft_dtw_loss_weight,
                         "normalize_loss": normalize_loss,
                         "dist_func": dist_func,
                         "gradient_clip": gradient_clip,
@@ -496,6 +659,14 @@ def train(
                         "deep_decode": deep_decode,
                         "band_radius_frames": band_radius_frames,
                         "anchor_loss_weight": anchor_loss_weight,
+                        "dense_anchor_loss_weight": dense_anchor_loss_weight,
+                        "path_distill_loss_weight": path_distill_loss_weight,
+                        "teacher_path_root": teacher_path_root,
+                        "num_anchor_samples": num_anchor_samples,
+                        "teacher_min_confidence": teacher_min_confidence,
+                        "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
+                        "eval_pool_size": eval_pool_size,
+                        "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
                         "anchor_temperature": anchor_temperature,
                         "anchor_min_anchor_gap": anchor_min_anchor_gap,
                     },
@@ -526,7 +697,10 @@ def train(
 def _empty_history() -> dict[str, list[float]]:
     return {
         "train_loss": [],
+        "train_soft_dtw_loss": [],
         "train_anchor_loss": [],
+        "train_dense_anchor_loss": [],
+        "train_path_distill_loss": [],
         "val_loss": [],
         "debug_mae": [],
         "debug_ar50": [],
@@ -542,6 +716,14 @@ def _empty_history() -> dict[str, list[float]]:
         "selection_secondary": [],
         "epoch_time": [],
     }
+
+
+def _ensure_history_keys(history: dict[str, list[float]]) -> dict[str, list[float]]:
+    """Backfill new history keys when warm-starting older checkpoints."""
+    defaults = _empty_history()
+    for key, value in defaults.items():
+        history.setdefault(key, list(value))
+    return history
 
 
 def _build_checkpoint_payload(
@@ -599,7 +781,9 @@ def _load_resume_state(
         raise ValueError(f"Checkpoint at {checkpoint_path} does not contain model weights.")
 
     saved_signature = checkpoint.get("training_state_signature")
-    if saved_signature == current_signature:
+    if _normalise_training_state_signature(saved_signature) == _normalise_training_state_signature(
+        current_signature
+    ):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "lr_scheduler_state_dict" in checkpoint:
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
@@ -622,14 +806,37 @@ def _load_resume_state(
     return 0, _empty_history(), None, {}
 
 
+def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None:
+    """Preserve resume compatibility with checkpoints saved before frontend keys existed."""
+    if not isinstance(signature, dict):
+        return None
+    normalised = dict(signature)
+    normalised.setdefault("sr", 22050)
+    normalised.setdefault("hop_length", 220)
+    normalised.setdefault("dense_anchor_loss_weight", 0.0)
+    normalised.setdefault("soft_dtw_loss_weight", 1.0)
+    normalised.setdefault("path_distill_loss_weight", 0.0)
+    normalised.setdefault("teacher_path_root", None)
+    normalised.setdefault("num_anchor_samples", 64)
+    normalised.setdefault("teacher_min_confidence", 0.0)
+    normalised.setdefault("disable_time_stretch_for_anchors", True)
+    normalised.setdefault("eval_pool_size", 2)
+    normalised.setdefault("alignment_eval_every_n_epochs", 1)
+    return normalised
+
+
 def _evaluate_swd_pairs(
     pairs: Sequence[Any],
     *,
+    dataset: Any | None,
+    sr: int,
+    hop_length: int,
     encoder: CRNNEncoder,
     device: str | None,
     cache_root: str | None,
     deep_decode: str,
     band_radius_frames: int | None,
+    pool_size: int = 2,
 ) -> dict[str, float]:
     if not pairs:
         return {"mae": np.nan, "ar_50ms": np.nan, "ar_100ms": np.nan, "ar_200ms": np.nan, "pairs": 0.0}
@@ -640,12 +847,16 @@ def _evaluate_swd_pairs(
     for pair in pairs:
         pair_rows = evaluate_pair(
             pair,
+            dataset=dataset,
             methods=["deepalign"],
             encoder=encoder,
+            sr=sr,
+            deep_hop=hop_length,
             device=device,
             cache_root=cache_root,
             deep_decode=deep_decode,
             band_radius_frames=band_radius_frames,
+            pool_size=pool_size,
         )
         rows.extend(pair_rows)
 
@@ -767,6 +978,56 @@ def _load_training_config(path: str | None) -> dict[str, Any]:
     return config
 
 
+def _is_headline_claim_config(config: dict[str, Any]) -> bool:
+    claim_cfg = config.get("claim", {})
+    if not isinstance(claim_cfg, dict):
+        return False
+    claim_name = str(claim_cfg.get("name", "")).strip().lower()
+    return bool(claim_cfg.get("headline", False)) or claim_name in HEADLINE_CLAIM_NAMES
+
+
+def _validate_headline_claim_config(config: dict[str, Any], *, path: str | None = None) -> None:
+    """
+    Ensure the headline initial-claim config cannot silently use off-claim help.
+
+    The headline route is audio-only learned DeepAlign with unconstrained DTW.
+    Measure-anchor sampling/losses and guided decoders stay available for
+    diagnostics, but they must not be mixed into this config.
+    """
+    dataset_cfg = config.get("dataset", {})
+    training_cfg = config.get("training", {})
+    evaluation_cfg = config.get("evaluation", {})
+    errors: list[str] = []
+
+    if dataset_cfg.get("segment_sampling") != "teacher_path":
+        errors.append("dataset.segment_sampling must be 'teacher_path'")
+
+    for key in ("anchor_loss_weight", "dense_anchor_loss_weight"):
+        if float(training_cfg.get(key, 0.0) or 0.0) > 0.0:
+            errors.append(f"training.{key} must be 0 for the headline claim")
+
+    teacher_root = str(training_cfg.get("teacher_path_root", "") or "").lower()
+    if not teacher_root:
+        errors.append("training.teacher_path_root is required for headline teacher distillation")
+    if "anchor_calibrated" in teacher_root or "calibrated" in teacher_root:
+        errors.append("training.teacher_path_root must not point at calibrated/anchor artifacts")
+
+    if evaluation_cfg.get("deep_decode", "unconstrained") != "unconstrained":
+        errors.append("evaluation.deep_decode must be 'unconstrained'")
+    if int(evaluation_cfg.get("pool_size", 1) or 1) != 1:
+        errors.append("evaluation.pool_size must be 1")
+    if evaluation_cfg.get("band_radius_frames") is not None:
+        errors.append("evaluation.band_radius_frames must be null")
+
+    if errors:
+        location = f" at {path}" if path else ""
+        raise ValueError(
+            "Headline claim config is not initial-claim eligible"
+            f"{location}: "
+            + "; ".join(errors)
+        )
+
+
 def _resolve_option(cli_value: Any, config_value: Any, default: Any) -> Any:
     if cli_value is not None:
         return cli_value
@@ -780,29 +1041,66 @@ def _split_swd_pairs(
     *,
     val_split: float,
     random_seed: int = 42,
+    heldout_lieder: Sequence[str] | None = None,
 ) -> tuple[list[Any], list[Any]]:
-    """Split SWD pairs once at the pair level to avoid train/val leakage."""
+    """Split SWD pairs at the lied level to avoid shared-recording leakage."""
     if not 0.0 < val_split < 1.0:
         raise ValueError("val_split must be between 0 and 1.")
     if len(pairs) < 2:
         raise ValueError("Need at least two SWD pairs to build train/validation splits.")
 
     ordered_pairs = sorted(pairs, key=lambda pair: getattr(pair, "pair_id", str(pair)))
+    by_lied: dict[str, list[Any]] = {}
+    for pair in ordered_pairs:
+        lied_id = str(getattr(pair, "lied_id", "")).strip().upper()
+        if not lied_id:
+            raise ValueError("Every SWD pair must expose a lied_id for leakage-safe splitting.")
+        by_lied.setdefault(lied_id, []).append(pair)
+
+    if len(by_lied) < 2:
+        raise ValueError("Need at least two lieder to build leakage-safe train/validation splits.")
+
+    ordered_lieder = sorted(by_lied)
+    requested_heldout = {
+        str(lied_id).strip().upper()
+        for lied_id in heldout_lieder or ()
+        if str(lied_id).strip()
+    }
+    val_lied_ids = {lied_id for lied_id in ordered_lieder if lied_id in requested_heldout}
+
+    candidate_lieder = [lied_id for lied_id in ordered_lieder if lied_id not in val_lied_ids]
     rng = np.random.default_rng(random_seed)
-    indices = np.arange(len(ordered_pairs))
-    rng.shuffle(indices)
+    shuffled_candidates = list(candidate_lieder)
+    rng.shuffle(shuffled_candidates)
 
-    n_val = max(1, int(len(ordered_pairs) * val_split))
-    n_val = min(n_val, len(ordered_pairs) - 1)
-    val_indices = set(indices[:n_val].tolist())
+    target_val_lieder = max(1, int(len(ordered_lieder) * val_split))
+    extra_needed = max(0, target_val_lieder - len(val_lied_ids))
+    max_extra = max(0, len(candidate_lieder) - 1)
+    val_lied_ids.update(shuffled_candidates[: min(extra_needed, max_extra)])
 
-    train_pairs = [pair for idx, pair in enumerate(ordered_pairs) if idx not in val_indices]
-    val_pairs = [pair for idx, pair in enumerate(ordered_pairs) if idx in val_indices]
+    if not val_lied_ids:
+        val_lied_ids.add(shuffled_candidates[0])
+    if len(val_lied_ids) == len(ordered_lieder):
+        raise ValueError(
+            "The held-out debug/validation lieder cover the whole dataset; "
+            "at least one lied must remain for training."
+        )
+
+    train_pairs = [
+        pair for pair in ordered_pairs if str(pair.lied_id).strip().upper() not in val_lied_ids
+    ]
+    val_pairs = [
+        pair for pair in ordered_pairs if str(pair.lied_id).strip().upper() in val_lied_ids
+    ]
+    if not train_pairs or not val_pairs:
+        raise ValueError("Leakage-safe split produced an empty train or validation partition.")
     return train_pairs, val_pairs
 
 
 def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_training_config(args.config)
+    if _is_headline_claim_config(config):
+        _validate_headline_claim_config(config, path=args.config)
     dataset_cfg = config.get("dataset", {})
     audio_cfg = config.get("audio", {})
     model_cfg = config.get("model", {})
@@ -832,6 +1130,8 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": _resolve_option(args.batch_size, training_cfg.get("batch_size"), 4),
         "lr": _resolve_option(args.lr, training_cfg.get("lr"), 1e-3),
         "embed_dim": _resolve_option(args.embed_dim, model_cfg.get("embed_dim"), 64),
+        "sr": _resolve_option(args.sr, audio_cfg.get("sr"), 22050),
+        "hop_length": _resolve_option(args.hop_length, audio_cfg.get("hop_length"), 220),
         "n_freq_bins": _resolve_option(args.n_freq_bins, audio_cfg.get("n_bins"), 84),
         "num_conv_channels": _resolve_option(args.conv_channels, model_cfg.get("conv_channels"), None),
         "gru_hidden_size": _resolve_option(args.gru_hidden_size, model_cfg.get("gru_hidden_size"), 128),
@@ -855,6 +1155,11 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "start_gamma": _resolve_option(args.start_gamma, soft_dtw_cfg.get("start_gamma"), 1.0),
         "end_gamma": _resolve_option(args.end_gamma, soft_dtw_cfg.get("end_gamma"), 0.01),
+        "soft_dtw_loss_weight": _resolve_option(
+            args.soft_dtw_loss_weight,
+            soft_dtw_cfg.get("loss_weight"),
+            1.0,
+        ),
         "normalize_loss": _resolve_option(args.normalize_loss, soft_dtw_cfg.get("normalize"), True),
         "dist_func": _resolve_option(args.dist_func, soft_dtw_cfg.get("dist_func"), "sqeuclidean"),
         "gradient_clip": _resolve_option(args.gradient_clip, training_cfg.get("gradient_clip"), 1.0),
@@ -892,6 +1197,46 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("anchor_loss_weight"),
             0.0,
         ),
+        "dense_anchor_loss_weight": _resolve_option(
+            args.dense_anchor_loss_weight,
+            training_cfg.get("dense_anchor_loss_weight"),
+            0.0,
+        ),
+        "path_distill_loss_weight": _resolve_option(
+            args.path_distill_loss_weight,
+            training_cfg.get("path_distill_loss_weight"),
+            0.0,
+        ),
+        "teacher_path_root": _resolve_option(
+            args.teacher_path_root,
+            training_cfg.get("teacher_path_root"),
+            None,
+        ),
+        "num_anchor_samples": _resolve_option(
+            args.num_anchor_samples,
+            training_cfg.get("num_anchor_samples"),
+            64,
+        ),
+        "teacher_min_confidence": _resolve_option(
+            args.teacher_min_confidence,
+            training_cfg.get("teacher_min_confidence"),
+            0.0,
+        ),
+        "disable_time_stretch_for_anchors": _resolve_option(
+            args.disable_time_stretch_for_anchors,
+            training_cfg.get("disable_time_stretch_for_anchors"),
+            True,
+        ),
+        "eval_pool_size": _resolve_option(
+            args.eval_pool_size,
+            evaluation_cfg.get("pool_size"),
+            2,
+        ),
+        "alignment_eval_every_n_epochs": _resolve_option(
+            args.alignment_eval_every_n_epochs,
+            evaluation_cfg.get("alignment_eval_every_n_epochs"),
+            1,
+        ),
         "anchor_temperature": _resolve_option(
             args.anchor_temperature,
             training_cfg.get("anchor_temperature"),
@@ -915,6 +1260,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--embed-dim", type=int, default=None)
+    parser.add_argument("--sr", type=int, default=None)
+    parser.add_argument("--hop-length", type=int, default=None)
     parser.add_argument("--n-freq-bins", type=int, default=None)
     parser.add_argument("--conv-channels", type=int, nargs="+", default=None)
     parser.add_argument("--gru-hidden-size", type=int, default=None)
@@ -925,13 +1272,14 @@ def main() -> None:
     parser.add_argument(
         "--segment-sampling",
         type=str,
-        choices=["aligned_measures", "independent_random"],
+        choices=["aligned_measures", "independent_random", "teacher_path", "self_audio"],
         default=None,
     )
     parser.add_argument("--samples-per-epoch", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--start-gamma", type=float, default=None)
     parser.add_argument("--end-gamma", type=float, default=None)
+    parser.add_argument("--soft-dtw-loss-weight", type=float, default=None)
     parser.add_argument("--gradient-clip", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--val-split", type=float, default=None)
@@ -945,9 +1293,26 @@ def main() -> None:
         default=None,
     )
     parser.add_argument("--cache-root", type=str, default=None)
-    parser.add_argument("--deep-decode", type=str, choices=["unconstrained", "diagonal_band", "chroma_guided_band"], default=None)
+    parser.add_argument("--deep-decode", type=str, choices=list(TRAIN_DEEP_DECODE_CHOICES), default=None)
     parser.add_argument("--band-radius-frames", type=int, default=None)
     parser.add_argument("--anchor-loss-weight", type=float, default=None)
+    parser.add_argument("--dense-anchor-loss-weight", type=float, default=None)
+    parser.add_argument("--path-distill-loss-weight", type=float, default=None)
+    parser.add_argument("--teacher-path-root", type=str, default=None)
+    parser.add_argument("--num-anchor-samples", type=int, default=None)
+    parser.add_argument("--teacher-min-confidence", type=float, default=None)
+    parser.add_argument(
+        "--disable-time-stretch-for-anchors",
+        dest="disable_time_stretch_for_anchors",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--allow-time-stretch-for-anchors",
+        dest="disable_time_stretch_for_anchors",
+        action="store_false",
+    )
+    parser.add_argument("--eval-pool-size", type=int, default=None)
+    parser.add_argument("--alignment-eval-every-n-epochs", type=int, default=None)
     parser.add_argument("--anchor-temperature", type=float, default=None)
     parser.add_argument("--anchor-min-anchor-gap", type=int, default=None)
     parser.add_argument("--no-augment", action="store_true")
@@ -966,7 +1331,11 @@ def main() -> None:
         action="store_false",
         help="Disable normalized Soft-DTW divergence",
     )
-    parser.set_defaults(normalize_loss=None, cache_spectrograms=None)
+    parser.set_defaults(
+        normalize_loss=None,
+        cache_spectrograms=None,
+        disable_time_stretch_for_anchors=None,
+    )
 
     args = parser.parse_args()
     training_kwargs = _build_training_kwargs(args)

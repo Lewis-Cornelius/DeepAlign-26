@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -38,8 +38,13 @@ class AnchorContrastiveLoss(nn.Module):
             if batch_idx >= len(anchor_frames_a) or batch_idx >= len(anchor_frames_b):
                 break
 
-            idx_a = torch.as_tensor(anchor_frames_a[batch_idx], device=emb_a.device, dtype=torch.long)
-            idx_b = torch.as_tensor(anchor_frames_b[batch_idx], device=emb_b.device, dtype=torch.long)
+            frames_a = anchor_frames_a[batch_idx]
+            frames_b = anchor_frames_b[batch_idx]
+            if frames_a is None or frames_b is None or len(frames_a) == 0 or len(frames_b) == 0:
+                continue
+
+            idx_a = torch.as_tensor(frames_a, device=emb_a.device, dtype=torch.long)
+            idx_b = torch.as_tensor(frames_b, device=emb_b.device, dtype=torch.long)
             n_anchors = min(idx_a.numel(), idx_b.numel())
             if n_anchors < 2:
                 continue
@@ -79,3 +84,130 @@ class AnchorContrastiveLoss(nn.Module):
         if not off_diagonal.any():
             return None
         return mask
+
+
+class PathDistillationLoss(AnchorContrastiveLoss):
+    """
+    Contrastive loss over dense teacher-path frame correspondences.
+
+    Sampled teacher frames are positives, and nearby temporal offsets become
+    local negatives. This teaches sub-second precision instead of only asking
+    the model to separate distant points on the same path.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        min_anchor_gap: int = 1,
+        local_radius: int = 12,
+        local_step: int = 3,
+    ):
+        super().__init__(temperature=temperature, min_anchor_gap=min_anchor_gap)
+        self.local_radius = max(1, int(local_radius))
+        self.local_step = max(1, int(local_step))
+
+    def forward(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        anchor_frames_a: Sequence[Sequence[int]] | None,
+        anchor_frames_b: Sequence[Sequence[int]] | None,
+    ) -> Tensor:
+        if not anchor_frames_a or not anchor_frames_b:
+            return emb_a.new_zeros(())
+
+        offsets = self._candidate_offsets(device=emb_a.device)
+        target_index = int((offsets == 0).nonzero(as_tuple=False)[0].item())
+        losses: list[Tensor] = []
+        for batch_idx in range(emb_a.shape[0]):
+            if batch_idx >= len(anchor_frames_a) or batch_idx >= len(anchor_frames_b):
+                break
+
+            frames_a = anchor_frames_a[batch_idx]
+            frames_b = anchor_frames_b[batch_idx]
+            if frames_a is None or frames_b is None or len(frames_a) == 0 or len(frames_b) == 0:
+                continue
+
+            idx_a = torch.as_tensor(frames_a, device=emb_a.device, dtype=torch.long)
+            idx_b = torch.as_tensor(frames_b, device=emb_b.device, dtype=torch.long)
+            n_points = min(idx_a.numel(), idx_b.numel())
+            if n_points == 0:
+                continue
+
+            idx_a = idx_a[:n_points].clamp_(0, emb_a.shape[1] - 1)
+            idx_b = idx_b[:n_points].clamp_(0, emb_b.shape[1] - 1)
+            losses.extend(
+                self._local_losses_one_direction(
+                    queries=emb_a[batch_idx],
+                    references=emb_b[batch_idx],
+                    query_indices=idx_a,
+                    reference_indices=idx_b,
+                    offsets=offsets,
+                    target_index=target_index,
+                )
+            )
+            losses.extend(
+                self._local_losses_one_direction(
+                    queries=emb_b[batch_idx],
+                    references=emb_a[batch_idx],
+                    query_indices=idx_b,
+                    reference_indices=idx_a,
+                    offsets=offsets,
+                    target_index=target_index,
+                )
+            )
+
+        if not losses:
+            return emb_a.new_zeros(())
+        return torch.stack(losses).mean()
+
+    def _candidate_offsets(self, *, device: torch.device) -> Tensor:
+        offsets = torch.arange(
+            -self.local_radius,
+            self.local_radius + 1,
+            self.local_step,
+            device=device,
+            dtype=torch.long,
+        )
+        if not (offsets == 0).any():
+            offsets = torch.cat([offsets, torch.zeros(1, device=device, dtype=torch.long)])
+            offsets = torch.sort(offsets).values
+        return offsets
+
+    def _local_losses_one_direction(
+        self,
+        *,
+        queries: Tensor,
+        references: Tensor,
+        query_indices: Tensor,
+        reference_indices: Tensor,
+        offsets: Tensor,
+        target_index: int,
+    ) -> list[Tensor]:
+        query_vecs = nn.functional.normalize(queries[query_indices], dim=-1)
+        raw_candidate_indices = reference_indices[:, None] + offsets[None, :]
+        valid_candidates = (
+            (raw_candidate_indices >= 0)
+            & (raw_candidate_indices < references.shape[0])
+            & (offsets.abs()[None, :] >= self.min_anchor_gap)
+        )
+        valid_candidates[:, target_index] = True
+        rows_with_negatives = valid_candidates.clone()
+        rows_with_negatives[:, target_index] = False
+        row_mask = rows_with_negatives.any(dim=1)
+        if not row_mask.any():
+            return []
+
+        query_vecs = query_vecs[row_mask]
+        candidate_indices = raw_candidate_indices[row_mask].clamp_(0, references.shape[0] - 1)
+        valid_candidates = valid_candidates[row_mask]
+        candidate_vecs = nn.functional.normalize(references[candidate_indices], dim=-1)
+        logits = torch.einsum("nd,nkd->nk", query_vecs, candidate_vecs) / self.temperature
+        logits = logits.masked_fill(~valid_candidates, torch.finfo(logits.dtype).min)
+        targets = torch.full(
+            (query_vecs.shape[0],),
+            target_index,
+            device=queries.device,
+            dtype=torch.long,
+        )
+        return [nn.functional.cross_entropy(logits, targets)]

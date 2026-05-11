@@ -184,6 +184,7 @@ best evidence package and is the result to use unless a later full-SWD run beats
 - `deepalign evaluate-swd`
 - `deepalign evaluate-mazurka`
 - `deepalign merge-results`
+- `deepalign generate-teacher-paths`
 
 Supported `--methods` values:
 
@@ -206,6 +207,63 @@ Supported `--deep-decode` values for `deepalign`:
 
 The transcription decode modes cache Basic Pitch note/onset/contour outputs under `.cache/transcription/basic_pitch` by default. They keep the CSV method as `deepalign` and record the variant in `deep_decode`, so dissertation tables can treat them as DeepAlign variants rather than external baselines.
 The refined/score-guided modes are experimental research variants; promote them only when a gate run beats `deepalign_transcription_fused` on full-SWD `AR@50ms`.
+
+### Initial-Claim Audio-Only Sprint
+
+The restored headline route is `config/deepalign_initial_claim_audio_only_unconstrained.yaml`
+with `scripts/run_initial_claim_audio_only_unconstrained.ps1`. This path is intentionally
+strict:
+
+- training crops come from audio-only teacher paths, not SWD measure anchors
+- training may use teacher-path distillation and Soft-DTW, but anchor losses stay off
+- final evaluation uses `deepalign` with `deep_decode=unconstrained`, `--pool-size 1`,
+  and no skipped pairs
+
+Run the complete gate sequence with:
+
+```powershell
+scripts/run_initial_claim_audio_only_unconstrained.ps1 -Mode All -SwdPath data -Device cuda
+```
+
+The hard write-up gate is full SWD `MAE < 50 ms` and `AR@50ms > 98%`. Add
+`-RequireSotaStretch` when the run should also fail unless it reaches the final
+`MAE < 20 ms` stretch target.
+
+### Diagnostic Teacher Tracks
+
+The audio-only SOTA sprint is driven by `config/deepalign_sota_audio_only_2026_05_09.yaml`
+and `scripts/run_audio_only_sota_2026_05_09.ps1`. It first generates strict teacher-path
+artifacts with:
+
+```bash
+deepalign generate-teacher-paths data \
+  --output-dir results/teacher_audio_only_sota_2026_05_09 \
+  --hop-length 110 \
+  --trim-top-db 40 \
+  --estimate-chroma-shift
+```
+
+The command writes per-pair `.npz` paths plus `teacher_results.csv` and
+`oracle_results.csv`. Training uses those teacher paths only as supervision; final
+DeepAlign evaluation remains audio-only and should be run with `--deep-hop 110` and
+`--pool-size 1`.
+
+The separate supervised fallback track is diagnostic-only for the initial claim.
+It keeps final inference audio-only, but calibrates dense teacher paths with SWD
+measure anchors for training, so it must not be reported as the headline
+audio-only result:
+
+```bash
+deepalign generate-teacher-paths data \
+  --output-dir results/teacher_anchor_calibrated_sota_2026_05_10 \
+  --hop-length 110 \
+  --trim-top-db 40 \
+  --estimate-chroma-shift \
+  --anchor-calibrate
+```
+
+Train that fallback with `config/deepalign_sota_anchor_calibrated_2026_05_10.yaml`
+and keep its results separate from the strict audio-only teacher gate.
 
 ### Analysis
 

@@ -1,0 +1,66 @@
+# Audio-only SOTA sprint: teacher-distilled DeepAlign, strict full-SWD promotion.
+
+dataset:
+  swd_path: null
+  max_length_sec: 12.0
+  segment_sampling: aligned_measures
+  samples_per_epoch: 256
+  cache_spectrograms: true
+  cache_root: .cache/cqt
+  debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
+  val_split: 0.2
+  performances: null
+
+audio:
+  sr: 22050
+  hop_length: 110
+  n_bins: 84
+  bins_per_octave: 12
+
+model:
+  embed_dim: 64
+  conv_channels: [32, 64, 128, 128]
+  gru_hidden_size: 128
+  num_gru_layers: 2
+  dropout: 0.1
+  temporal_attention_heads: 0
+
+training:
+  epochs: 24
+  batch_size: 3
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  resume_from: checkpoints/cycle1_stage1_local_precision_2026_04_19/best_model.pt
+  selection_metric: debug_ar50
+  anchor_loss_weight: 0.0
+  dense_anchor_loss_weight: 0.15
+  path_distill_loss_weight: 0.75
+  teacher_path_root: results/teacher_audio_only_sota_2026_05_09/paths
+  num_anchor_samples: 96
+  disable_time_stretch_for_anchors: true
+  anchor_temperature: 0.07
+  anchor_min_anchor_gap: 2
+
+soft_dtw:
+  start_gamma: 0.1
+  end_gamma: 0.01
+  normalize: true
+  dist_func: sqeuclidean
+
+augmentation:
+  enabled: true
+  time_stretch_range: [1.0, 1.0]
+  pitch_shift_range: [-1, 1]
+  noise_snr_range: [25.0, 45.0]
+  augment_prob: 0.35
+
+evaluation:
+  deep_decode: unconstrained
+  deep_distance: sqeuclidean
+  pool_size: 1
+  band_radius_frames: null
+
+output:
+  checkpoint_dir: checkpoints/sota_audio_only_2026_05_09
+  save_every_n_epochs: 1

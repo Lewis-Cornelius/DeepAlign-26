@@ -200,7 +200,7 @@ def evaluate_pairwise_methods(
     if "chroma_dtw" in methods and chroma_a is not None and chroma_b is not None:
         path, _, runtime = fast_dtw_align(chroma_a, chroma_b, distance="cosine")
         frame_duration = chroma_hop / sr
-        pred_b = np.interp(gt_a, path[0] * frame_duration, path[1] * frame_duration)
+        pred_b = _interp_monotonic(gt_a, path[0] * frame_duration, path[1] * frame_duration)
         results.append(
             _build_result_row(
                 dataset=dataset_name,
@@ -221,7 +221,7 @@ def evaluate_pairwise_methods(
     if "mrmsdtw" in methods and chroma_a is not None and chroma_b is not None:
         result = align_mrmsdtw(chroma_a, chroma_b, memory_limit_mb=mrmsdtw_memory_limit_mb, feature_rate=sr / chroma_hop)
         frame_duration = chroma_hop / sr
-        pred_b = np.interp(gt_a, result.path[0] * frame_duration, result.path[1] * frame_duration)
+        pred_b = _interp_monotonic(gt_a, result.path[0] * frame_duration, result.path[1] * frame_duration)
         results.append(
             _build_result_row(
                 dataset=dataset_name,
@@ -446,7 +446,7 @@ def evaluate_pairwise_methods(
             )
         if resolved_deep_decode != "deepalign_score_guided_refined":
             frame_duration_d = (deep_hop * pool_size) / sr
-            pred_b_d = np.interp(gt_a, path_d[0] * frame_duration_d, path_d[1] * frame_duration_d)
+            pred_b_d = _interp_monotonic(gt_a, path_d[0] * frame_duration_d, path_d[1] * frame_duration_d)
             if resolved_deep_decode == "deepalign_transcription_fused_refined":
                 if refinement_features is None:
                     raise ValueError("Local refinement requires fused transcription features.")

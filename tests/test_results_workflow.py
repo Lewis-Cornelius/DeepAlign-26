@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from dis_alignment.analysis.statistics import friedman_nemenyi_analysis
 from dis_alignment.data.mazurka import MazurkaDataset, MazurkaPair, MazurkaPerformance
@@ -427,6 +428,120 @@ def test_swd_evaluate_pair_skips_matchmaker_failure(monkeypatch, tmp_path):
     )
 
     assert [row["method"] for row in results] == ["chroma_dtw"]
+
+
+def test_swd_dataset_evaluation_fails_on_pair_error(monkeypatch, tmp_path):
+    pair = SWDPair(
+        pair_id="D911-01_AL98_SC06",
+        lied_id="D911-01",
+        piece_a=SWDPiece(
+            piece_id="D911-01_AL98",
+            lied_id="D911-01",
+            performance_id="AL98",
+            audio_path=tmp_path / "a.wav",
+        ),
+        piece_b=SWDPiece(
+            piece_id="D911-01_SC06",
+            lied_id="D911-01",
+            performance_id="SC06",
+            audio_path=tmp_path / "b.wav",
+        ),
+    )
+    dataset = type("Dataset", (), {"iter_pairs": lambda self, **kwargs: [pair]})()
+
+    monkeypatch.setattr(
+        swd_eval,
+        "evaluate_pair",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("decoder failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="D911-01_AL98_SC06"):
+        swd_eval.evaluate_swd_dataset(
+            dataset,
+            methods="chroma_dtw",
+            show_progress=False,
+        )
+
+
+def test_swd_dataset_evaluation_records_allowed_skips(monkeypatch, tmp_path):
+    pair = SWDPair(
+        pair_id="D911-01_AL98_SC06",
+        lied_id="D911-01",
+        piece_a=SWDPiece(
+            piece_id="D911-01_AL98",
+            lied_id="D911-01",
+            performance_id="AL98",
+            audio_path=tmp_path / "a.wav",
+        ),
+        piece_b=SWDPiece(
+            piece_id="D911-01_SC06",
+            lied_id="D911-01",
+            performance_id="SC06",
+            audio_path=tmp_path / "b.wav",
+        ),
+    )
+    dataset = type("Dataset", (), {"iter_pairs": lambda self, **kwargs: [pair]})()
+
+    monkeypatch.setattr(
+        swd_eval,
+        "evaluate_pair",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("decoder failed")),
+    )
+
+    results = swd_eval.evaluate_swd_dataset(
+        dataset,
+        methods="chroma_dtw",
+        show_progress=False,
+        allow_skips=True,
+    )
+
+    failures = results.attrs["failures"]
+    assert results.empty
+    assert failures.loc[0, "pair_id"] == pair.pair_id
+    assert failures.loc[0, "error_type"] == "RuntimeError"
+
+
+def test_swd_dataset_evaluation_fails_when_requested_method_is_missing(monkeypatch, tmp_path):
+    pair = SWDPair(
+        pair_id="D911-01_AL98_SC06",
+        lied_id="D911-01",
+        piece_a=SWDPiece(
+            piece_id="D911-01_AL98",
+            lied_id="D911-01",
+            performance_id="AL98",
+            audio_path=tmp_path / "a.wav",
+        ),
+        piece_b=SWDPiece(
+            piece_id="D911-01_SC06",
+            lied_id="D911-01",
+            performance_id="SC06",
+            audio_path=tmp_path / "b.wav",
+        ),
+    )
+    dataset = type("Dataset", (), {"iter_pairs": lambda self, **kwargs: [pair]})()
+
+    monkeypatch.setattr(
+        swd_eval,
+        "evaluate_pair",
+        lambda *args, **kwargs: [
+            {
+                "method": "chroma_dtw",
+                "mae": 0.0,
+                "median_ae": 0.0,
+                "ar_50ms": 1.0,
+                "ar_100ms": 1.0,
+                "ar_200ms": 1.0,
+                "runtime_s": 0.0,
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="matchmaker"):
+        swd_eval.evaluate_swd_dataset(
+            dataset,
+            methods="chroma_dtw,matchmaker",
+            show_progress=False,
+        )
 
 
 def test_mazurka_dataset_discovers_pairs_from_metadata(tmp_path):

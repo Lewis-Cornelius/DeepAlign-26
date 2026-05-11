@@ -214,6 +214,42 @@ def test_banded_dtw_path_is_monotonic():
     assert np.all(np.diff(path[1]) >= 0)
 
 
+def test_pairwise_dtw_evaluation_collapses_duplicate_query_frames(monkeypatch):
+    """Direct DTW paths can repeat query frames; evaluation should average them safely."""
+
+    monkeypatch.setattr(
+        "dis_alignment.features.chroma.extract_chroma_cqt",
+        lambda audio, sr=1, hop_length=1: np.eye(3, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        eval_common,
+        "fast_dtw_align",
+        lambda features_a, features_b, distance="cosine": (
+            np.array([[0, 1, 1, 2], [0, 0, 2, 2]], dtype=np.intp),
+            0.0,
+            0.0,
+        ),
+    )
+
+    rows = eval_common.evaluate_pairwise_methods(
+        methods=["chroma_dtw"],
+        pair_id="pair",
+        group_id="group",
+        dataset_name="test",
+        piece_a_id="a",
+        piece_b_id="b",
+        audio_a=np.zeros(3, dtype=np.float32),
+        audio_b=np.zeros(3, dtype=np.float32),
+        gt_a=np.array([1.0], dtype=np.float64),
+        gt_b=np.array([1.0], dtype=np.float64),
+        chroma_hop=1,
+        sr=1,
+    )
+
+    assert rows[0]["mae"] == 0.0
+    assert rows[0]["ar_50ms"] == 1.0
+
+
 def test_chroma_guided_band_decode_produces_valid_alignment(monkeypatch, tmp_path):
     pair = _make_swd_pair(tmp_path)
 
