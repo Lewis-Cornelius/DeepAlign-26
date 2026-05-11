@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -180,6 +181,8 @@ def test_original_plan_supervised_route_keeps_20ms_target():
     assert evaluation["alignment_eval_every_n_epochs"] == 1
 
     runner = (repo_root / "scripts" / "run_initial_plan_supervised_20ms_sprint.ps1").read_text(encoding="utf-8")
+    assert "scripts/check_teacher_result_gate.py" in runner
+    assert "anchor_calibrated_audio_teacher" in runner
     assert "MaxMaeMs 20" in runner
     assert "MinAr50Pct 98" in runner
     assert "--deep-hop\", \"110\"" in runner
@@ -193,3 +196,43 @@ def test_strict_ablation_runner_does_not_weaken_final_gate():
     assert "Gate 4 threshold: <20 ms and >98% AR@50" in runner
     assert "MaxMaeMs 20" in runner
     assert "MaxMaeMs 59" not in runner
+
+
+def test_teacher_gate_checker_accepts_anchor_calibrated_teacher_rows(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script_path = repo_root / "scripts" / "check_teacher_result_gate.py"
+    spec = importlib.util.spec_from_file_location("check_teacher_result_gate", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    csv_path = tmp_path / "teacher_results.csv"
+    pd.DataFrame(
+        [
+            {
+                "method": "anchor_calibrated_audio_teacher",
+                "mae": 0.010,
+                "ar_50ms": 1.0,
+            },
+            {
+                "method": "audio_teacher",
+                "mae": 0.500,
+                "ar_50ms": 0.0,
+            },
+        ]
+    ).to_csv(csv_path, index=False)
+
+    assert (
+        module.main(
+            [
+                str(csv_path),
+                "20",
+                "98",
+                "1",
+                "--method",
+                "anchor_calibrated_audio_teacher",
+            ]
+        )
+        == 0
+    )

@@ -49,6 +49,26 @@ function Invoke-ResultGate {
     )
 }
 
+function Invoke-TeacherResultGate {
+    param(
+        [string]$Label,
+        [string]$CsvPath,
+        [double]$MaxMaeMs,
+        [double]$MinAr50Pct,
+        [int]$ExpectedPairs,
+        [string]$Method
+    )
+    Invoke-CheckedPython $Label @(
+        "scripts/check_teacher_result_gate.py",
+        $CsvPath,
+        "$MaxMaeMs",
+        "$MinAr50Pct",
+        "$ExpectedPairs",
+        "--method",
+        $Method
+    )
+}
+
 function Invoke-StrictEval {
     param(
         [string]$Label,
@@ -94,12 +114,13 @@ function Invoke-Teacher {
         "--min-ar50", "0.98",
         "--max-mae-ms", "20"
     )
-    Invoke-ResultGate `
+    Invoke-TeacherResultGate `
         -Label "Teacher target gate: <20 ms and >98% AR@50" `
         -CsvPath (Join-Path $TeacherDir "teacher_results.csv") `
         -MaxMaeMs 20 `
         -MinAr50Pct 98 `
-        -ExpectedPairs 24
+        -ExpectedPairs 24 `
+        -Method "anchor_calibrated_audio_teacher"
 }
 
 function Invoke-Train {

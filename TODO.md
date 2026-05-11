@@ -33,7 +33,7 @@ Tracking progress for the DeepAlign-26 project.
 
 - [x] `.venv312\Scripts\python.exe -m dis_alignment.cli --help`
 - [x] `.venv312\Scripts\python.exe -m pytest -q`
-- [x] Current full test suite: `138 passed`
+- [x] Current full test suite: `141 passed`
 - [x] Current SWD figures regenerated from the promoted evidence CSV
 
 ## Remaining Work
