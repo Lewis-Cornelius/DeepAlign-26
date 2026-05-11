@@ -10,6 +10,7 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # General Python
 *.egg-info/
@@ -32,3 +33,8 @@ results/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local planning/scratch artifacts
+InitialPlan.pdf
+_InitialPlan.txt
+_tmp_*.html
