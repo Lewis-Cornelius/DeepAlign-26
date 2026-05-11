@@ -424,6 +424,137 @@ def mine_pseudo_teacher_paths(
             )
 
 
+@main.command(name="mine-self-paths")
+@click.argument("swd_path", type=click.Path(exists=True))
+@click.option("--checkpoint", type=click.Path(exists=True), required=True, help="Learned DeepAlign checkpoint")
+@click.option("--output-dir", "-o", default="results/self_mined_initial_claim_strict", help="Self-mined artifact directory")
+@click.option("--sr", type=int, default=22050, help="Audio sample rate")
+@click.option("--hop-length", type=int, default=110, help="DeepAlign feature hop length used for mining")
+@click.option("--pool-size", type=int, default=1, help="Optional feature pooling before DTW")
+@click.option("--deep-distance", type=click.Choice(["cosine", "sqeuclidean"]), default="sqeuclidean")
+@click.option("--device", type=str, default=None)
+@click.option("--cache-root", type=click.Path(), default=None, help="Directory for cached mining CQTs")
+@click.option("--performance", "performances", multiple=True, help="Limit to one or more performance ids")
+@click.option("--lied", "lieder", multiple=True, help="Limit to one or more lied ids")
+@click.option("--quiet", is_flag=True, help="Disable progress bar")
+def mine_self_paths(
+    swd_path: str,
+    checkpoint: str,
+    output_dir: str,
+    sr: int,
+    hop_length: int,
+    pool_size: int,
+    deep_distance: str,
+    device: str | None,
+    cache_root: str | None,
+    performances: tuple[str, ...],
+    lieder: tuple[str, ...],
+    quiet: bool,
+) -> None:
+    """Mine strict audio-only paths from a learned DeepAlign checkpoint."""
+    import json
+    import time
+
+    import numpy as np
+    import pandas as pd
+    from tqdm import tqdm
+
+    from dis_alignment.alignment.teacher import (
+        TeacherPath,
+        evaluate_oracle_alignment,
+        evaluate_teacher_path,
+        save_teacher_path,
+        summarize_teacher_results,
+    )
+    from dis_alignment.data import SWDDataset
+    from dis_alignment.data.swd import load_swd_audio
+    from dis_alignment.evaluation.common import fast_dtw_align, temporal_pool
+    from dis_alignment.model.inference import extract_deep_features, load_trained_encoder
+
+    dataset = SWDDataset(swd_path)
+    encoder, _ = load_trained_encoder(checkpoint, device=device)
+    output = Path(output_dir)
+    paths_dir = output / "paths"
+    paths_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, object]] = []
+    oracle_rows: list[dict[str, object]] = []
+    manifest: list[dict[str, object]] = []
+    pair_iter = list(dataset.iter_pairs(performances=list(performances) or None, lieder=list(lieder) or None))
+    iterator = tqdm(pair_iter, desc="Mining self paths", disable=quiet)
+    for pair in iterator:
+        audio_a, _ = load_swd_audio(pair.piece_a, sr=sr)
+        audio_b, _ = load_swd_audio(pair.piece_b, sr=sr)
+        start = time.perf_counter()
+        features_a = extract_deep_features(
+            audio_a,
+            encoder,
+            sr=sr,
+            hop_length=hop_length,
+            device=device,
+            audio_path=pair.piece_a.audio_path,
+            cache_root=cache_root,
+        )
+        features_b = extract_deep_features(
+            audio_b,
+            encoder,
+            sr=sr,
+            hop_length=hop_length,
+            device=device,
+            audio_path=pair.piece_b.audio_path,
+            cache_root=cache_root,
+        )
+        pooled_a = temporal_pool(features_a, pool_size=pool_size)
+        pooled_b = temporal_pool(features_b, pool_size=pool_size)
+        path, _, _ = fast_dtw_align(pooled_a, pooled_b, distance=deep_distance)
+        frame_duration = hop_length * max(1, int(pool_size)) / sr
+        teacher_path = TeacherPath(
+            pair_id=pair.pair_id,
+            lied_id=pair.lied_id,
+            piece_a_id=pair.piece_a.piece_id,
+            piece_b_id=pair.piece_b.piece_id,
+            frame_hop=hop_length * max(1, int(pool_size)),
+            sr=sr,
+            path=path,
+            time_a_s=path[0].astype(np.float64) * frame_duration,
+            time_b_s=path[1].astype(np.float64) * frame_duration,
+            anchor_calibrated=False,
+            confidence=np.ones(path.shape[1], dtype=np.float32),
+        )
+        path_file = save_teacher_path(teacher_path, paths_dir)
+        row = evaluate_teacher_path(pair, teacher_path, method="deepalign_self_mined_path")
+        row["runtime_s"] = time.perf_counter() - start
+        rows.append(row)
+        oracle_rows.append(evaluate_oracle_alignment(pair))
+        manifest.append(
+            {
+                "pair_id": pair.pair_id,
+                "lied_id": pair.lied_id,
+                "path": str(path_file),
+                "source_checkpoint": str(checkpoint),
+                "hop_length": int(hop_length),
+                "pool_size": int(pool_size),
+                "deep_distance": deep_distance,
+                "points": int(path.shape[1]),
+            }
+        )
+
+    results = pd.DataFrame(rows)
+    oracle = pd.DataFrame(oracle_rows)
+    results.to_csv(output / "self_mined_results.csv", index=False)
+    oracle.to_csv(output / "oracle_results.csv", index=False)
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    summary = summarize_teacher_results(results)
+    click.echo(f"Self-mined paths saved under {paths_dir}")
+    click.echo(f"Self-mined diagnostic CSV: {output / 'self_mined_results.csv'}")
+    click.echo(
+        "Self-mined paths: "
+        f"pairs={int(summary['pairs'])}, "
+        f"MAE={summary['mae'] * 1000:.3f} ms, "
+        f"AR@50={summary['ar_50ms'] * 100:.3f}%"
+    )
+
+
 @main.command()
 @click.option("--config", type=click.Path(exists=True), default=None, help="YAML training config")
 @click.option("--swd-path", type=click.Path(exists=True), default=None, help="Path to the SWD root")
@@ -444,7 +575,7 @@ def mine_pseudo_teacher_paths(
 )
 @click.option(
     "--segment-sampling",
-    type=click.Choice(["aligned_measures", "independent_random", "teacher_path", "self_audio"]),
+    type=click.Choice(["aligned_measures", "independent_random", "teacher_path", "self_audio", "same_lied_pair", "self_mined_path"]),
     default=None,
     help="Segment sampling strategy for SWD training pairs",
 )
@@ -464,7 +595,11 @@ def mine_pseudo_teacher_paths(
 @click.option("--anchor-loss-weight", type=float, default=None, help="Optional anchor contrastive loss weight")
 @click.option("--dense-anchor-loss-weight", type=float, default=None, help="Dense measure-anchor contrastive loss weight")
 @click.option("--path-distill-loss-weight", type=float, default=None, help="Teacher-path distillation loss weight")
+@click.option("--sequence-contrastive-loss-weight", type=float, default=None, help="Same-lied sequence contrastive loss weight")
+@click.option("--anti-collapse-loss-weight", type=float, default=None, help="Embedding anti-collapse regularization weight")
+@click.option("--anti-collapse-covariance-weight", type=float, default=None, help="Covariance term inside anti-collapse regularization")
 @click.option("--teacher-path-root", type=click.Path(), default=None, help="Directory containing teacher path NPZ files")
+@click.option("--self-mined-path-root", type=click.Path(), default=None, help="Directory containing model self-mined path NPZ files")
 @click.option("--num-anchor-samples", type=int, default=None, help="Teacher path samples per aligned crop")
 @click.option("--teacher-min-confidence", type=float, default=None, help="Minimum teacher confidence for distillation samples")
 @click.option(
@@ -474,6 +609,11 @@ def mine_pseudo_teacher_paths(
 )
 @click.option("--eval-pool-size", type=int, default=None, help="DeepAlign temporal pool size for training gates")
 @click.option("--alignment-eval-every-n-epochs", type=int, default=None, help="Run alignment gates every N epochs; 0 disables")
+@click.option(
+    "--track-debug-checkpoints/--no-track-debug-checkpoints",
+    default=None,
+    help="Save debug-metric best checkpoints in addition to the configured selection metric",
+)
 @click.option("--anchor-temperature", type=float, default=None, help="Anchor contrastive loss temperature")
 @click.option("--anchor-min-anchor-gap", type=int, default=None, help="Minimum event gap for anchor negatives")
 @click.option("--no-augment", is_flag=True, help="Disable waveform augmentation")
@@ -503,12 +643,17 @@ def train(
     anchor_loss_weight: float | None,
     dense_anchor_loss_weight: float | None,
     path_distill_loss_weight: float | None,
+    sequence_contrastive_loss_weight: float | None,
+    anti_collapse_loss_weight: float | None,
+    anti_collapse_covariance_weight: float | None,
     teacher_path_root: str | None,
+    self_mined_path_root: str | None,
     num_anchor_samples: int | None,
     teacher_min_confidence: float | None,
     disable_time_stretch_for_anchors: bool | None,
     eval_pool_size: int | None,
     alignment_eval_every_n_epochs: int | None,
+    track_debug_checkpoints: bool | None,
     anchor_temperature: float | None,
     anchor_min_anchor_gap: int | None,
     no_augment: bool,
@@ -589,7 +734,11 @@ def train(
         anchor_loss_weight=_coalesce(anchor_loss_weight, training_cfg.get("anchor_loss_weight"), 0.0),
         dense_anchor_loss_weight=_coalesce(dense_anchor_loss_weight, training_cfg.get("dense_anchor_loss_weight"), 0.0),
         path_distill_loss_weight=_coalesce(path_distill_loss_weight, training_cfg.get("path_distill_loss_weight"), 0.0),
+        sequence_contrastive_loss_weight=_coalesce(sequence_contrastive_loss_weight, training_cfg.get("sequence_contrastive_loss_weight"), 0.0),
+        anti_collapse_loss_weight=_coalesce(anti_collapse_loss_weight, training_cfg.get("anti_collapse_loss_weight"), 0.0),
+        anti_collapse_covariance_weight=_coalesce(anti_collapse_covariance_weight, training_cfg.get("anti_collapse_covariance_weight"), 0.01),
         teacher_path_root=_coalesce(teacher_path_root, training_cfg.get("teacher_path_root"), None),
+        self_mined_path_root=_coalesce(self_mined_path_root, training_cfg.get("self_mined_path_root"), None),
         num_anchor_samples=_coalesce(num_anchor_samples, training_cfg.get("num_anchor_samples"), 64),
         teacher_min_confidence=_coalesce(teacher_min_confidence, training_cfg.get("teacher_min_confidence"), 0.0),
         disable_time_stretch_for_anchors=_coalesce(
@@ -603,6 +752,7 @@ def train(
             training_config.get("evaluation", {}).get("alignment_eval_every_n_epochs"),
             1,
         ),
+        track_debug_checkpoints=_coalesce(track_debug_checkpoints, training_cfg.get("track_debug_checkpoints"), True),
         anchor_temperature=_coalesce(anchor_temperature, training_cfg.get("anchor_temperature"), 0.1),
         anchor_min_anchor_gap=_coalesce(anchor_min_anchor_gap, training_cfg.get("anchor_min_anchor_gap"), 1),
         dry_run=dry_run,

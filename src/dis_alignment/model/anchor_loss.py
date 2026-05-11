@@ -211,3 +211,124 @@ class PathDistillationLoss(AnchorContrastiveLoss):
             dtype=torch.long,
         )
         return [nn.functional.cross_entropy(logits, targets)]
+
+
+class SequenceContrastiveLoss(nn.Module):
+    """
+    Contrast whole same-lied performance pairs against other lieder in the batch.
+
+    The positive is the row-wise pair (A_i, B_i). Other batch items are negatives,
+    except items with the same lied id, which are masked to avoid false negatives.
+    """
+
+    def __init__(self, temperature: float = 0.1):
+        super().__init__()
+        self.temperature = float(temperature)
+
+    def forward(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        lengths_a: Tensor | Sequence[int] | None = None,
+        lengths_b: Tensor | Sequence[int] | None = None,
+        group_ids: Sequence[str] | None = None,
+    ) -> Tensor:
+        if emb_a.shape[0] < 2 or emb_b.shape[0] < 2:
+            return emb_a.new_zeros(())
+
+        pooled_a = self._masked_mean_pool(emb_a, lengths_a)
+        pooled_b = self._masked_mean_pool(emb_b, lengths_b)
+        pooled_a = nn.functional.normalize(pooled_a, dim=-1)
+        pooled_b = nn.functional.normalize(pooled_b, dim=-1)
+        logits_ab = pooled_a @ pooled_b.T / self.temperature
+        logits_ba = pooled_b @ pooled_a.T / self.temperature
+        valid_mask = self._negative_mask(emb_a.shape[0], group_ids=group_ids, device=emb_a.device)
+        targets = torch.arange(emb_a.shape[0], device=emb_a.device)
+        losses: list[Tensor] = []
+        for logits in (logits_ab, logits_ba):
+            row_has_negative = valid_mask.clone()
+            row_has_negative.fill_diagonal_(False)
+            row_mask = row_has_negative.any(dim=1)
+            if not row_mask.any():
+                continue
+            masked_logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+            losses.append(nn.functional.cross_entropy(masked_logits[row_mask], targets[row_mask]))
+        if not losses:
+            return emb_a.new_zeros(())
+        return torch.stack(losses).mean()
+
+    @staticmethod
+    def _masked_mean_pool(emb: Tensor, lengths: Tensor | Sequence[int] | None) -> Tensor:
+        if lengths is None:
+            return emb.mean(dim=1)
+        length_tensor = torch.as_tensor(lengths, device=emb.device, dtype=torch.long)
+        length_tensor = length_tensor.clamp(min=1, max=emb.shape[1])
+        frames = torch.arange(emb.shape[1], device=emb.device)[None, :]
+        mask = frames < length_tensor[:, None]
+        masked = emb * mask.unsqueeze(-1).to(dtype=emb.dtype)
+        return masked.sum(dim=1) / length_tensor.to(dtype=emb.dtype).unsqueeze(-1)
+
+    @staticmethod
+    def _negative_mask(
+        batch_size: int,
+        *,
+        group_ids: Sequence[str] | None,
+        device: torch.device,
+    ) -> Tensor:
+        mask = torch.ones(batch_size, batch_size, dtype=torch.bool, device=device)
+        if group_ids is not None and len(group_ids) >= batch_size:
+            labels = [str(value) for value in group_ids[:batch_size]]
+            for row in range(batch_size):
+                for col in range(batch_size):
+                    if row != col and labels[row] == labels[col]:
+                        mask[row, col] = False
+        mask.fill_diagonal_(True)
+        return mask
+
+
+class EmbeddingAntiCollapseLoss(nn.Module):
+    """
+    Penalize collapsed embeddings with a VICReg-style variance/covariance term.
+    """
+
+    def __init__(self, target_std: float = 1.0, covariance_weight: float = 0.01, eps: float = 1e-4):
+        super().__init__()
+        self.target_std = float(target_std)
+        self.covariance_weight = float(covariance_weight)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        lengths_a: Tensor | Sequence[int] | None = None,
+        lengths_b: Tensor | Sequence[int] | None = None,
+    ) -> Tensor:
+        frames = [
+            self._valid_frames(emb_a, lengths_a),
+            self._valid_frames(emb_b, lengths_b),
+        ]
+        values = torch.cat([frame for frame in frames if frame.numel() > 0], dim=0)
+        if values.shape[0] < 2:
+            return emb_a.new_zeros(())
+
+        centered = values - values.mean(dim=0, keepdim=True)
+        std = torch.sqrt(centered.var(dim=0, unbiased=False) + self.eps)
+        variance_loss = torch.relu(self.target_std - std).mean()
+
+        covariance_loss = emb_a.new_zeros(())
+        if values.shape[0] > 2 and values.shape[1] > 1 and self.covariance_weight > 0:
+            cov = centered.T @ centered / (values.shape[0] - 1)
+            cov = cov - torch.diag(torch.diag(cov))
+            covariance_loss = cov.pow(2).sum() / values.shape[1]
+        return variance_loss + (self.covariance_weight * covariance_loss)
+
+    @staticmethod
+    def _valid_frames(emb: Tensor, lengths: Tensor | Sequence[int] | None) -> Tensor:
+        if lengths is None:
+            return emb.reshape(-1, emb.shape[-1])
+        length_tensor = torch.as_tensor(lengths, device=emb.device, dtype=torch.long)
+        length_tensor = length_tensor.clamp(min=0, max=emb.shape[1])
+        frames = torch.arange(emb.shape[1], device=emb.device)[None, :]
+        mask = frames < length_tensor[:, None]
+        return emb[mask]

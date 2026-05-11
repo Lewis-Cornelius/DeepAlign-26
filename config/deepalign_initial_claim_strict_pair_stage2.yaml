@@ -1,19 +1,17 @@
-# Diagnostic-only bootstrap: train on audio-only coarse-DTW pseudo anchors.
+# Strict headline Stage 2: same-lied cross-performance training.
 #
-# The pseudo anchors come from audio-only chroma/onset DTW. They are not score,
-# transcription, measure-anchor, or duration-band decoder labels, but this is
-# not headline-eligible for the strict initial claim because it uses a teacher.
+# Positives are sampled by SWD lied identity only; no timestamps or teacher paths.
 
 claim:
-  name: diagnostic_audio_teacher_pseudo_bootstrap
-  headline: false
+  name: initial_audio_only_unconstrained
+  headline: true
 
 dataset:
   swd_path: null
   max_length_sec: 4.0
-  segment_sampling: teacher_path
-  samples_per_epoch: 96
-  cache_spectrograms: true
+  segment_sampling: same_lied_pair
+  samples_per_epoch: 192
+  cache_spectrograms: false
   cache_root: .cache/cqt
   debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
   val_split: 0.2
@@ -34,27 +32,32 @@ model:
   temporal_attention_heads: 0
 
 training:
-  epochs: 8
+  epochs: 16
   batch_size: 4
-  lr: 0.0001
+  lr: 0.00005
   weight_decay: 0.0001
   gradient_clip: 1.0
-  resume_from: checkpoints/initial_claim_self_audio_pretrain/best_model.pt
-  selection_metric: debug_ar50
+  resume_from: checkpoints/initial_claim_strict_ssl_stage1/best_model.pt
+  selection_metric: val_loss
+  track_debug_checkpoints: false
   anchor_loss_weight: 0.0
   dense_anchor_loss_weight: 0.0
-  path_distill_loss_weight: 1.0
-  teacher_path_root: results/pseudo_initial_claim_audio_only/paths
+  path_distill_loss_weight: 0.0
+  sequence_contrastive_loss_weight: 1.0
+  anti_collapse_loss_weight: 0.05
+  anti_collapse_covariance_weight: 0.01
+  teacher_path_root: null
+  self_mined_path_root: null
   teacher_min_confidence: 0.0
-  num_anchor_samples: 128
+  num_anchor_samples: 0
   disable_time_stretch_for_anchors: true
-  anchor_temperature: 0.05
+  anchor_temperature: 0.07
   anchor_min_anchor_gap: 3
 
 soft_dtw:
   loss_weight: 0.0
   start_gamma: 0.1
-  end_gamma: 0.01
+  end_gamma: 0.03
   normalize: true
   dist_func: sqeuclidean
 
@@ -62,16 +65,16 @@ augmentation:
   enabled: true
   time_stretch_range: [1.0, 1.0]
   pitch_shift_range: [-1, 1]
-  noise_snr_range: [25.0, 45.0]
-  augment_prob: 0.35
+  noise_snr_range: [20.0, 45.0]
+  augment_prob: 0.45
 
 evaluation:
   deep_decode: unconstrained
   deep_distance: sqeuclidean
   pool_size: 1
   band_radius_frames: null
-  alignment_eval_every_n_epochs: 2
+  alignment_eval_every_n_epochs: 0
 
 output:
-  checkpoint_dir: checkpoints/initial_claim_pseudo_bootstrap
+  checkpoint_dir: checkpoints/initial_claim_strict_pair_stage2
   save_every_n_epochs: 1

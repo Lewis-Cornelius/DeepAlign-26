@@ -25,6 +25,15 @@ from dis_alignment.model.augmentation import AudioAugmentor
 
 logger = logging.getLogger(__name__)
 
+SEGMENT_SAMPLING_MODES = (
+    "aligned_measures",
+    "independent_random",
+    "teacher_path",
+    "self_audio",
+    "same_lied_pair",
+    "self_mined_path",
+)
+
 
 @dataclass(frozen=True)
 class AlignedMeasureWindow:
@@ -84,6 +93,7 @@ class SWDPairDataset(Dataset):
         cache_spectrograms: bool = False,
         cache_root: str | Path | None = None,
         teacher_path_root: str | Path | None = None,
+        self_mined_path_root: str | Path | None = None,
         num_teacher_samples: int = 64,
         teacher_min_confidence: float = 0.0,
     ):
@@ -106,22 +116,21 @@ class SWDPairDataset(Dataset):
         self.cache_spectrograms = cache_spectrograms
         self.cache_root = Path(cache_root) if cache_root is not None else None
         self.teacher_path_root = Path(teacher_path_root) if teacher_path_root is not None else None
+        self.self_mined_path_root = Path(self_mined_path_root) if self_mined_path_root is not None else None
         self.num_teacher_samples = max(0, int(num_teacher_samples))
         self.teacher_min_confidence = float(teacher_min_confidence)
         self._teacher_cache: dict[str, TeacherPath | None] = {}
+        self._self_mined_cache: dict[str, TeacherPath | None] = {}
 
-        if self.segment_sampling not in {
-            "aligned_measures",
-            "independent_random",
-            "teacher_path",
-            "self_audio",
-        }:
+        if self.segment_sampling not in SEGMENT_SAMPLING_MODES:
             raise ValueError(
                 "segment_sampling must be one of "
-                "{'aligned_measures', 'independent_random', 'teacher_path', 'self_audio'}"
+                f"{set(SEGMENT_SAMPLING_MODES)}"
             )
         if self.segment_sampling == "teacher_path" and self.teacher_path_root is None:
             raise ValueError("teacher_path sampling requires teacher_path_root.")
+        if self.segment_sampling == "self_mined_path" and self.self_mined_path_root is None:
+            raise ValueError("self_mined_path sampling requires self_mined_path_root.")
 
         self.pairs = list(pairs)
         self._windows_by_pair_id: dict[str, list[AlignedMeasureWindow]] = {}
@@ -209,8 +218,12 @@ class SWDPairDataset(Dataset):
                 audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
                 audio_a = self._maybe_crop(audio_a)
                 audio_b = self._maybe_crop(audio_b)
-        elif self.segment_sampling == "teacher_path":
-            teacher_window = self._select_teacher_path_window(pair)
+        elif self.segment_sampling in {"teacher_path", "self_mined_path"}:
+            teacher_window = (
+                self._select_teacher_path_window(pair)
+                if self.segment_sampling == "teacher_path"
+                else self._select_self_mined_path_window(pair)
+            )
             if teacher_window is not None and self._spectrogram_cache is not None:
                 log_cqt_a = self._spectrogram_cache.load_or_compute(pair.piece_a.audio_path)
                 log_cqt_b = self._spectrogram_cache.load_or_compute(pair.piece_b.audio_path)
@@ -247,13 +260,17 @@ class SWDPairDataset(Dataset):
                 )
             else:
                 logger.warning(
-                    "Falling back to independent crops for %s because no teacher window was found.",
+                    "Falling back to independent crops for %s because no path window was found.",
                     pair.pair_id,
                 )
                 audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
                 audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
                 audio_a = self._maybe_crop(audio_a)
                 audio_b = self._maybe_crop(audio_b)
+        elif self.segment_sampling == "same_lied_pair":
+            audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
+            audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
+            audio_a, audio_b = self._same_relative_crop_pair(audio_a, audio_b)
         elif self.segment_sampling == "self_audio":
             piece = pair.piece_a
             if not self.deterministic and self._rng.random() >= 0.5:
@@ -280,6 +297,9 @@ class SWDPairDataset(Dataset):
             "spec_a": torch.from_numpy(spec_a).float().unsqueeze(0),
             "spec_b": torch.from_numpy(spec_b).float().unsqueeze(0),
             "pair_id": pair.pair_id,
+            "lied_id": pair.lied_id,
+            "piece_a_id": pair.piece_a.piece_id,
+            "piece_b_id": pair.piece_b.piece_id,
             "segment_sampling": self.segment_sampling,
         }
         if window is not None:
@@ -308,25 +328,46 @@ class SWDPairDataset(Dataset):
                 }
             )
         elif teacher_window is not None:
-            teacher_frames_a, teacher_frames_b = self._teacher_frames_for_bounds(
-                pair,
-                start_a_s=teacher_window.start_a_s,
-                end_a_s=teacher_window.end_a_s,
-                start_b_s=teacher_window.start_b_s,
-                end_b_s=teacher_window.end_b_s,
-                n_frames_a=spec_a.shape[1],
-                n_frames_b=spec_b.shape[1],
-            )
+            if self.segment_sampling == "self_mined_path":
+                teacher_frames_a, teacher_frames_b = self._self_mined_frames_for_bounds(
+                    pair,
+                    start_a_s=teacher_window.start_a_s,
+                    end_a_s=teacher_window.end_a_s,
+                    start_b_s=teacher_window.start_b_s,
+                    end_b_s=teacher_window.end_b_s,
+                    n_frames_a=spec_a.shape[1],
+                    n_frames_b=spec_b.shape[1],
+                )
+            else:
+                teacher_frames_a, teacher_frames_b = self._teacher_frames_for_bounds(
+                    pair,
+                    start_a_s=teacher_window.start_a_s,
+                    end_a_s=teacher_window.end_a_s,
+                    start_b_s=teacher_window.start_b_s,
+                    end_b_s=teacher_window.end_b_s,
+                    n_frames_a=spec_a.shape[1],
+                    n_frames_b=spec_b.shape[1],
+                )
             sample.update(
                 {
-                    "teacher_window_start_a_s": teacher_window.start_a_s,
-                    "teacher_window_start_b_s": teacher_window.start_b_s,
-                    "teacher_window_duration_a_s": teacher_window.end_a_s - teacher_window.start_a_s,
-                    "teacher_window_duration_b_s": teacher_window.end_b_s - teacher_window.start_b_s,
+                    "path_window_start_a_s": teacher_window.start_a_s,
+                    "path_window_start_b_s": teacher_window.start_b_s,
+                    "path_window_duration_a_s": teacher_window.end_a_s - teacher_window.start_a_s,
+                    "path_window_duration_b_s": teacher_window.end_b_s - teacher_window.start_b_s,
                     "teacher_frame_indices_a": teacher_frames_a,
                     "teacher_frame_indices_b": teacher_frames_b,
                     "anchor_frame_indices_a": [],
                     "anchor_frame_indices_b": [],
+                }
+            )
+        elif self.segment_sampling == "same_lied_pair":
+            sample.update(
+                {
+                    "anchor_frame_indices_a": [],
+                    "anchor_frame_indices_b": [],
+                    "teacher_frame_indices_a": [],
+                    "teacher_frame_indices_b": [],
+                    "positive_pair": True,
                 }
             )
         elif self.segment_sampling == "self_audio":
@@ -409,6 +450,51 @@ class SWDPairDataset(Dataset):
         unique_a, unique_b = zip(*frame_pairs, strict=False)
         return list(unique_a), list(unique_b)
 
+    def _self_mined_frames_for_bounds(
+        self,
+        pair: SWDPair,
+        *,
+        start_a_s: float,
+        end_a_s: float,
+        start_b_s: float,
+        end_b_s: float,
+        n_frames_a: int,
+        n_frames_b: int,
+    ) -> tuple[list[int], list[int]]:
+        if self.self_mined_path_root is None or self.num_teacher_samples <= 0:
+            return [], []
+        path = self._load_self_mined_path(pair)
+        if path is None:
+            return [], []
+
+        mask = (
+            (path.time_a_s >= start_a_s)
+            & (path.time_a_s <= end_a_s)
+            & (path.time_b_s >= start_b_s)
+            & (path.time_b_s <= end_b_s)
+        )
+        available = np.flatnonzero(mask)
+        if available.size < 2:
+            return [], []
+
+        if self.deterministic or available.size <= self.num_teacher_samples:
+            positions = np.linspace(0, available.size - 1, min(available.size, self.num_teacher_samples), dtype=int)
+            selected = available[positions]
+        else:
+            selected = np.sort(
+                self._rng.choice(available, size=self.num_teacher_samples, replace=False)
+            )
+
+        frames_a = np.rint((path.time_a_s[selected] - start_a_s) * self.sr / self.hop_length)
+        frames_b = np.rint((path.time_b_s[selected] - start_b_s) * self.sr / self.hop_length)
+        frames_a = np.clip(frames_a, 0, n_frames_a - 1).astype(int)
+        frames_b = np.clip(frames_b, 0, n_frames_b - 1).astype(int)
+        frame_pairs = sorted(set(zip(frames_a.tolist(), frames_b.tolist(), strict=False)))
+        if not frame_pairs:
+            return [], []
+        unique_a, unique_b = zip(*frame_pairs, strict=False)
+        return list(unique_a), list(unique_b)
+
     def _load_teacher_path(self, pair: SWDPair) -> TeacherPath | None:
         if pair.pair_id in self._teacher_cache:
             return self._teacher_cache[pair.pair_id]
@@ -421,6 +507,19 @@ class SWDPairDataset(Dataset):
             teacher = None
         self._teacher_cache[pair.pair_id] = teacher
         return teacher
+
+    def _load_self_mined_path(self, pair: SWDPair) -> TeacherPath | None:
+        if pair.pair_id in self._self_mined_cache:
+            return self._self_mined_cache[pair.pair_id]
+        if self.self_mined_path_root is None:
+            return None
+        try:
+            path = load_teacher_path(self.self_mined_path_root, pair.pair_id)
+        except FileNotFoundError:
+            logger.warning("No self-mined path found for %s under %s", pair.pair_id, self.self_mined_path_root)
+            path = None
+        self._self_mined_cache[pair.pair_id] = path
+        return path
 
     def _identity_frames_for_specs(self, n_frames_a: int, n_frames_b: int) -> tuple[list[int], list[int]]:
         n_frames = min(int(n_frames_a), int(n_frames_b))
@@ -461,6 +560,31 @@ class SWDPairDataset(Dataset):
         center_b = float(teacher.time_b_s[selected])
         duration_a = max(float(np.nanmax(teacher.time_a_s)), center_a, 1.0)
         duration_b = max(float(np.nanmax(teacher.time_b_s)), center_b, 1.0)
+        start_a, end_a = self._centered_time_window(center_a, duration_a)
+        start_b, end_b = self._centered_time_window(center_b, duration_b)
+        return TeacherPathWindow(
+            start_a_s=start_a,
+            end_a_s=end_a,
+            start_b_s=start_b,
+            end_b_s=end_b,
+            center_a_s=center_a,
+            center_b_s=center_b,
+        )
+
+    def _select_self_mined_path_window(self, pair: SWDPair) -> TeacherPathWindow | None:
+        path = self._load_self_mined_path(pair)
+        if path is None or path.time_a_s.size == 0 or path.time_b_s.size == 0:
+            return None
+
+        available = np.flatnonzero(np.isfinite(path.time_a_s) & np.isfinite(path.time_b_s))
+        if available.size == 0:
+            return None
+
+        selected = available[available.size // 2] if self.deterministic else int(self._rng.choice(available))
+        center_a = float(path.time_a_s[selected])
+        center_b = float(path.time_b_s[selected])
+        duration_a = max(float(np.nanmax(path.time_a_s)), center_a, 1.0)
+        duration_b = max(float(np.nanmax(path.time_b_s)), center_b, 1.0)
         start_a, end_a = self._centered_time_window(center_a, duration_a)
         start_b, end_b = self._centered_time_window(center_b, duration_b)
         return TeacherPathWindow(
@@ -562,6 +686,27 @@ class SWDPairDataset(Dataset):
         else:
             start = int(self._rng.integers(0, len(audio) - self.max_samples + 1))
         return audio[start : start + self.max_samples]
+
+    def _same_relative_crop_pair(
+        self,
+        audio_a: NDArray[np.floating],
+        audio_b: NDArray[np.floating],
+    ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+        """Crop both same-lied recordings at the same relative audio position."""
+        if len(audio_a) <= self.max_samples and len(audio_b) <= self.max_samples:
+            return audio_a, audio_b
+
+        ratio = 0.5 if self.deterministic else float(self._rng.random())
+
+        def crop_one(audio: NDArray[np.floating]) -> NDArray[np.floating]:
+            if len(audio) <= self.max_samples:
+                return audio
+            max_start = len(audio) - self.max_samples
+            start = int(round(ratio * max_start))
+            start = min(max(0, start), max_start)
+            return audio[start : start + self.max_samples]
+
+        return crop_one(audio_a), crop_one(audio_b)
 
     def _crop_audio_window(
         self,

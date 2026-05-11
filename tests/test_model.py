@@ -341,6 +341,83 @@ class TestPathDistillationLoss:
         assert loss.item() == pytest.approx(0.0)
 
 
+class TestStrictAudioOnlyLosses:
+    """Tests for strict self-supervised headline losses."""
+
+    def test_sequence_contrastive_loss_prefers_rowwise_pairs(self):
+        from dis_alignment.model.anchor_loss import SequenceContrastiveLoss
+
+        loss_fn = SequenceContrastiveLoss(temperature=0.05)
+        emb_a = torch.eye(4).view(4, 1, 4).repeat(1, 3, 1)
+        emb_b = emb_a.clone()
+
+        loss = loss_fn(
+            emb_a,
+            emb_b,
+            lengths_a=torch.tensor([3, 3, 3, 3]),
+            lengths_b=torch.tensor([3, 3, 3, 3]),
+            group_ids=["D911-01", "D911-02", "D911-03", "D911-04"],
+        )
+
+        assert loss.item() < 0.01
+
+    def test_sequence_contrastive_masks_same_lied_false_negatives(self):
+        from dis_alignment.model.anchor_loss import SequenceContrastiveLoss
+
+        loss_fn = SequenceContrastiveLoss(temperature=0.1)
+        emb_a = torch.eye(2).view(2, 1, 2)
+        emb_b = emb_a.clone()
+
+        loss = loss_fn(emb_a, emb_b, group_ids=["D911-01", "D911-01"])
+
+        assert loss.item() == pytest.approx(0.0)
+
+    def test_anti_collapse_loss_penalizes_constant_embeddings_more(self):
+        from dis_alignment.model.anchor_loss import EmbeddingAntiCollapseLoss
+
+        loss_fn = EmbeddingAntiCollapseLoss(covariance_weight=0.0)
+        collapsed = torch.ones(2, 8, 4)
+        varied = torch.randn(2, 8, 4) * 2.0
+
+        collapsed_loss = loss_fn(collapsed, collapsed)
+        varied_loss = loss_fn(varied, varied)
+
+        assert collapsed_loss.item() > varied_loss.item()
+
+
+class TestMemoryEfficientDtw:
+    """Tests for strict full-DTW decoding without dense float64 matrices."""
+
+    def test_memory_efficient_dtw_matches_dense_cost(self):
+        from dis_alignment.evaluation.common import _memory_efficient_dtw_align, fast_dtw_align
+
+        rng = np.random.default_rng(123)
+        features_a = rng.normal(size=(5, 11)).astype(np.float32)
+        features_b = rng.normal(size=(5, 13)).astype(np.float32)
+
+        dense_path, dense_cost, _ = fast_dtw_align(features_a, features_b, distance="sqeuclidean")
+        mem_path, mem_cost, _ = _memory_efficient_dtw_align(
+            features_a,
+            features_b,
+            distance="sqeuclidean",
+        )
+
+        assert mem_cost == pytest.approx(dense_cost, rel=1e-5, abs=1e-5)
+        assert tuple(mem_path[:, 0]) == (0, 0)
+        assert tuple(mem_path[:, -1]) == (features_a.shape[1] - 1, features_b.shape[1] - 1)
+        assert np.all(np.diff(mem_path[0]) >= 0)
+        assert np.all(np.diff(mem_path[1]) >= 0)
+        assert dense_path.shape[0] == mem_path.shape[0] == 2
+
+    def test_large_pool_one_pairs_use_memory_efficient_dtw(self):
+        from dis_alignment.evaluation.common import _should_use_memory_efficient_dtw
+
+        assert _should_use_memory_efficient_dtw(50_000, 45_000, "sqeuclidean")
+        assert _should_use_memory_efficient_dtw(50_000, 45_000, "cosine")
+        assert not _should_use_memory_efficient_dtw(2_000, 2_000, "sqeuclidean")
+        assert not _should_use_memory_efficient_dtw(50_000, 45_000, "cityblock")
+
+
 # ---------------------------------------------------------------------------
 # Augmentation tests
 # ---------------------------------------------------------------------------
@@ -632,6 +709,99 @@ class TestSWDPairDatasetSampling:
         assert item["anchor_frame_indices_b"] == []
         assert item["teacher_frame_indices_a"] == item["teacher_frame_indices_b"]
         assert len(item["teacher_frame_indices_a"]) == 5
+
+    def test_same_lied_pair_sampling_uses_no_measure_anchors(self, monkeypatch, tmp_path):
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        pair = _make_pair(tmp_path, "D911-11")
+        monkeypatch.setattr(
+            dataset_module,
+            "compute_ground_truth_measure_alignment",
+            lambda pair_arg: (_ for _ in ()).throw(AssertionError("measure anchors used")),
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.arange(200, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.ones((2, max(1, len(audio) // 10)), dtype=np.float32),
+        )
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=10,
+            max_length_sec=6.0,
+            segment_sampling="same_lied_pair",
+            deterministic=True,
+        )
+
+        item = dataset[0]
+
+        assert item["segment_sampling"] == "same_lied_pair"
+        assert item["lied_id"] == "D911-11"
+        assert item["positive_pair"] is True
+        assert item["anchor_frame_indices_a"] == []
+        assert item["teacher_frame_indices_a"] == []
+
+    def test_self_mined_path_sampling_uses_separate_path_root(self, monkeypatch, tmp_path):
+        from dis_alignment.alignment.teacher import TeacherPath, save_teacher_path
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        pair = _make_pair(tmp_path, "D911-12")
+        mined_root = tmp_path / "self_mined"
+        times = np.arange(0, 20, dtype=np.float64)
+        save_teacher_path(
+            TeacherPath(
+                pair_id=pair.pair_id,
+                lied_id=pair.lied_id,
+                piece_a_id=pair.piece_a.piece_id,
+                piece_b_id=pair.piece_b.piece_id,
+                frame_hop=10,
+                sr=10,
+                path=np.vstack([np.arange(times.size), np.arange(times.size)]),
+                time_a_s=times,
+                time_b_s=times,
+            ),
+            mined_root,
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "compute_ground_truth_measure_alignment",
+            lambda pair_arg: (_ for _ in ()).throw(AssertionError("measure anchors used")),
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.zeros(300, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.ones((2, max(1, len(audio) // 10)), dtype=np.float32),
+        )
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=10,
+            max_length_sec=10.0,
+            segment_sampling="self_mined_path",
+            deterministic=True,
+            self_mined_path_root=mined_root,
+            num_teacher_samples=4,
+        )
+
+        item = dataset[0]
+
+        assert item["segment_sampling"] == "self_mined_path"
+        assert item["anchor_frame_indices_a"] == []
+        assert len(item["teacher_frame_indices_a"]) == 4
 
     def test_waveform_augmentation_is_applied_to_both_sides(self, monkeypatch, tmp_path):
         from dis_alignment.model import dataset as dataset_module
@@ -1003,12 +1173,14 @@ class TestTrainingPairSplit:
 
         config = {
             "claim": {"name": "initial_audio_only_unconstrained", "headline": True},
-            "dataset": {"segment_sampling": "teacher_path"},
+            "dataset": {"segment_sampling": "same_lied_pair"},
             "training": {
+                "selection_metric": "val_loss",
                 "anchor_loss_weight": 0.0,
                 "dense_anchor_loss_weight": 0.0,
-                "path_distill_loss_weight": 1.0,
-                "teacher_path_root": "results/teacher_initial_claim_audio_only/paths",
+                "path_distill_loss_weight": 0.0,
+                "sequence_contrastive_loss_weight": 1.0,
+                "teacher_path_root": None,
             },
             "evaluation": {
                 "deep_decode": "unconstrained",
@@ -1033,11 +1205,12 @@ class TestTrainingPairSplit:
 
         config = {
             "claim": {"name": "initial_audio_only_unconstrained", "headline": True},
-            "dataset": {"segment_sampling": "teacher_path"},
+            "dataset": {"segment_sampling": "self_audio"},
             "training": {
+                "selection_metric": "val_loss",
                 "anchor_loss_weight": 0.0,
                 "dense_anchor_loss_weight": 0.0,
-                "teacher_path_root": "results/teacher_initial_claim_audio_only/paths",
+                "teacher_path_root": None,
             },
             "evaluation": {
                 "deep_decode": bad_decode,
@@ -1049,16 +1222,17 @@ class TestTrainingPairSplit:
         with pytest.raises(ValueError, match="deep_decode"):
             _validate_headline_claim_config(config)
 
-    def test_headline_claim_config_rejects_measure_anchor_training(self):
+    def test_headline_claim_config_rejects_teacher_path_training(self):
         from dis_alignment.model.train import _validate_headline_claim_config
 
         config = {
             "claim": {"name": "initial_audio_only_unconstrained", "headline": True},
-            "dataset": {"segment_sampling": "aligned_measures"},
+            "dataset": {"segment_sampling": "teacher_path"},
             "training": {
+                "selection_metric": "val_loss",
                 "anchor_loss_weight": 0.0,
-                "dense_anchor_loss_weight": 0.2,
-                "teacher_path_root": "results/teacher_anchor_calibrated_sota/paths",
+                "dense_anchor_loss_weight": 0.0,
+                "teacher_path_root": "results/teacher_initial_claim_audio_only/paths",
             },
             "evaluation": {
                 "deep_decode": "unconstrained",
@@ -1068,4 +1242,53 @@ class TestTrainingPairSplit:
         }
 
         with pytest.raises(ValueError, match="segment_sampling"):
+            _validate_headline_claim_config(config)
+
+    def test_headline_claim_config_rejects_debug_checkpoint_selection(self):
+        from dis_alignment.model.train import _validate_headline_claim_config
+
+        config = {
+            "claim": {"name": "initial_audio_only_unconstrained", "headline": True},
+            "dataset": {"segment_sampling": "self_audio"},
+            "training": {
+                "selection_metric": "debug_ar50",
+                "anchor_loss_weight": 0.0,
+                "dense_anchor_loss_weight": 0.0,
+                "teacher_path_root": None,
+            },
+            "evaluation": {
+                "deep_decode": "unconstrained",
+                "pool_size": 1,
+                "band_radius_frames": None,
+            },
+        }
+
+        with pytest.raises(ValueError, match="selection_metric"):
+            _validate_headline_claim_config(config)
+
+    def test_tracked_selection_metrics_can_disable_debug_best_checkpoints(self):
+        from dis_alignment.model.train import _tracked_selection_metrics
+
+        assert _tracked_selection_metrics("val_loss", track_debug_checkpoints=False) == ("val_loss",)
+
+    def test_headline_claim_config_rejects_teacher_root_even_with_strict_sampling(self):
+        from dis_alignment.model.train import _validate_headline_claim_config
+
+        config = {
+            "claim": {"name": "initial_audio_only_unconstrained", "headline": True},
+            "dataset": {"segment_sampling": "self_audio"},
+            "training": {
+                "selection_metric": "val_loss",
+                "anchor_loss_weight": 0.0,
+                "dense_anchor_loss_weight": 0.0,
+                "teacher_path_root": "results/pseudo_initial_claim_audio_only/paths",
+            },
+            "evaluation": {
+                "deep_decode": "unconstrained",
+                "pool_size": 1,
+                "band_radius_frames": None,
+            },
+        }
+
+        with pytest.raises(ValueError, match="teacher_path_root"):
             _validate_headline_claim_config(config)

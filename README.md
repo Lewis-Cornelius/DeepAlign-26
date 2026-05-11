@@ -210,24 +210,29 @@ The refined/score-guided modes are experimental research variants; promote them 
 
 ### Initial-Claim Audio-Only Sprint
 
-The restored headline route is `config/deepalign_initial_claim_audio_only_unconstrained.yaml`
-with `scripts/run_initial_claim_audio_only_unconstrained.ps1`. This path is intentionally
-strict:
+The strict headline route is now `scripts/run_initial_claim_strict_audio_only_sprint.ps1`.
+It uses SWD audio only for training and keeps the final evaluation as learned-feature
+DeepAlign with unconstrained DTW:
 
-- training crops come from audio-only teacher paths, not SWD measure anchors
-- training may use teacher-path distillation and Soft-DTW, but anchor losses stay off
-- final evaluation uses `deepalign` with `deep_decode=unconstrained`, `--pool-size 1`,
+- Stage 1: `config/deepalign_initial_claim_strict_ssl_stage1.yaml` for same-audio
+  multi-view pretraining
+- Stage 2: `config/deepalign_initial_claim_strict_pair_stage2.yaml` for same-lied
+  cross-performance training with in-batch negatives
+- Stage 3: `config/deepalign_initial_claim_strict_selfmine_stage3.yaml` for optional
+  learned self-mined path refinement after Stage 2 passes its gate
+- final gates use `deepalign` with `deep_decode=unconstrained`, `--pool-size 1`,
   and no skipped pairs
 
 Run the complete gate sequence with:
 
 ```powershell
-scripts/run_initial_claim_audio_only_unconstrained.ps1 -Mode All -SwdPath data -Device cuda
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_initial_claim_strict_audio_only_sprint.ps1 -Mode All -SwdPath data -Device cuda
 ```
 
-The hard write-up gate is full SWD `MAE < 50 ms` and `AR@50ms > 98%`. Add
-`-RequireSotaStretch` when the run should also fail unless it reaches the final
-`MAE < 20 ms` stretch target.
+The hard headline gate is full SWD `MAE < 20 ms` and `AR@50ms > 98%`, with all
+24 pairs present. Teacher, pseudo-teacher, score-guided, transcription-guided,
+anchor-calibrated, chroma-guided, diagonal-band, and non-`pool_size=1` runs are
+diagnostic only for this claim.
 
 ### Diagnostic Teacher Tracks
 

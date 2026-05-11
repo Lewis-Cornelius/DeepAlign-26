@@ -17,7 +17,12 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
-from dis_alignment.model.anchor_loss import AnchorContrastiveLoss, PathDistillationLoss
+from dis_alignment.model.anchor_loss import (
+    AnchorContrastiveLoss,
+    EmbeddingAntiCollapseLoss,
+    PathDistillationLoss,
+    SequenceContrastiveLoss,
+)
 from dis_alignment.model.encoder import CRNNEncoder, DeepAlignModel
 from dis_alignment.model.recovery import normalize_debug_lied_ids
 from dis_alignment.model.soft_dtw_loss import GammaScheduler, SoftDTWLoss
@@ -108,12 +113,17 @@ def train(
     anchor_loss_weight: float = 0.0,
     dense_anchor_loss_weight: float = 0.0,
     path_distill_loss_weight: float = 0.0,
+    sequence_contrastive_loss_weight: float = 0.0,
+    anti_collapse_loss_weight: float = 0.0,
+    anti_collapse_covariance_weight: float = 0.01,
     teacher_path_root: str | None = None,
+    self_mined_path_root: str | None = None,
     num_anchor_samples: int = 64,
     teacher_min_confidence: float = 0.0,
     disable_time_stretch_for_anchors: bool = True,
     eval_pool_size: int = 2,
     alignment_eval_every_n_epochs: int = 1,
+    track_debug_checkpoints: bool = True,
     anchor_temperature: float = 0.1,
     anchor_min_anchor_gap: int = 1,
     dry_run: bool = False,
@@ -214,6 +224,7 @@ def train(
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
             teacher_path_root=teacher_path_root if path_distill_loss_weight > 0 else None,
+            self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
         )
@@ -231,6 +242,7 @@ def train(
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
             teacher_path_root=teacher_path_root if segment_sampling == "teacher_path" else None,
+            self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
         )
@@ -300,6 +312,16 @@ def train(
         if path_distill_loss_weight > 0
         else None
     )
+    sequence_contrastive_loss_fn = (
+        SequenceContrastiveLoss(temperature=anchor_temperature).to(dev)
+        if sequence_contrastive_loss_weight > 0
+        else None
+    )
+    anti_collapse_loss_fn = (
+        EmbeddingAntiCollapseLoss(covariance_weight=anti_collapse_covariance_weight).to(dev)
+        if anti_collapse_loss_weight > 0
+        else None
+    )
 
     gamma_scheduler = (
         GammaScheduler(
@@ -327,12 +349,17 @@ def train(
         "anchor_loss_weight": anchor_loss_weight,
         "dense_anchor_loss_weight": dense_anchor_loss_weight,
         "path_distill_loss_weight": path_distill_loss_weight,
+        "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
+        "anti_collapse_loss_weight": anti_collapse_loss_weight,
+        "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
         "teacher_path_root": str(teacher_path_root) if teacher_path_root is not None else None,
+        "self_mined_path_root": str(self_mined_path_root) if self_mined_path_root is not None else None,
         "num_anchor_samples": num_anchor_samples,
         "teacher_min_confidence": teacher_min_confidence,
         "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
         "eval_pool_size": eval_pool_size,
         "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
+        "track_debug_checkpoints": track_debug_checkpoints,
     }
     best_selections: dict[str, dict[str, Any]] = {}
     start_epoch = 0
@@ -362,6 +389,8 @@ def train(
         train_anchor_loss = 0.0
         train_dense_anchor_loss = 0.0
         train_path_distill_loss = 0.0
+        train_sequence_contrastive_loss = 0.0
+        train_anti_collapse_loss = 0.0
         n_batches = 0
 
         for batch in train_loader:
@@ -373,6 +402,7 @@ def train(
             anchor_frames_b = batch.get("anchor_frame_indices_b")
             teacher_frames_a = batch.get("teacher_frame_indices_a")
             teacher_frames_b = batch.get("teacher_frame_indices_b")
+            group_ids = batch.get("lied_id")
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=(dev.type == "cuda")):
@@ -399,6 +429,25 @@ def train(
                 if path_distill_loss_fn is not None:
                     path_distill_component = path_distill_loss_fn(emb_a, emb_b, teacher_frames_a, teacher_frames_b)
                     loss = loss + (path_distill_loss_weight * path_distill_component)
+                sequence_component = emb_a.new_zeros(())
+                if sequence_contrastive_loss_fn is not None:
+                    sequence_component = sequence_contrastive_loss_fn(
+                        emb_a,
+                        emb_b,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                        group_ids=group_ids,
+                    )
+                    loss = loss + (sequence_contrastive_loss_weight * sequence_component)
+                anti_collapse_component = emb_a.new_zeros(())
+                if anti_collapse_loss_fn is not None:
+                    anti_collapse_component = anti_collapse_loss_fn(
+                        emb_a,
+                        emb_b,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                    )
+                    loss = loss + (anti_collapse_loss_weight * anti_collapse_component)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -411,6 +460,8 @@ def train(
             train_anchor_loss += float(anchor_component.item())
             train_dense_anchor_loss += float(dense_anchor_component.item())
             train_path_distill_loss += float(path_distill_component.item())
+            train_sequence_contrastive_loss += float(sequence_component.item())
+            train_anti_collapse_loss += float(anti_collapse_component.item())
             n_batches += 1
 
         train_loss /= max(n_batches, 1)
@@ -418,11 +469,15 @@ def train(
         train_anchor_loss /= max(n_batches, 1)
         train_dense_anchor_loss /= max(n_batches, 1)
         train_path_distill_loss /= max(n_batches, 1)
+        train_sequence_contrastive_loss /= max(n_batches, 1)
+        train_anti_collapse_loss /= max(n_batches, 1)
         history["train_loss"].append(train_loss)
         history["train_soft_dtw_loss"].append(train_soft_dtw_loss)
         history["train_anchor_loss"].append(train_anchor_loss)
         history["train_dense_anchor_loss"].append(train_dense_anchor_loss)
         history["train_path_distill_loss"].append(train_path_distill_loss)
+        history["train_sequence_contrastive_loss"].append(train_sequence_contrastive_loss)
+        history["train_anti_collapse_loss"].append(train_anti_collapse_loss)
 
         model.eval()
         val_loss = 0.0
@@ -442,6 +497,7 @@ def train(
                 anchor_frames_b = batch.get("anchor_frame_indices_b")
                 teacher_frames_a = batch.get("teacher_frame_indices_a")
                 teacher_frames_b = batch.get("teacher_frame_indices_b")
+                group_ids = batch.get("lied_id")
                 if anchor_loss_fn is not None:
                     loss = loss + (
                         anchor_loss_weight
@@ -456,6 +512,27 @@ def train(
                     loss = loss + (
                         path_distill_loss_weight
                         * path_distill_loss_fn(emb_a, emb_b, teacher_frames_a, teacher_frames_b)
+                    )
+                if sequence_contrastive_loss_fn is not None:
+                    loss = loss + (
+                        sequence_contrastive_loss_weight
+                        * sequence_contrastive_loss_fn(
+                            emb_a,
+                            emb_b,
+                            lengths_a=lengths_a,
+                            lengths_b=lengths_b,
+                            group_ids=group_ids,
+                        )
+                    )
+                if anti_collapse_loss_fn is not None:
+                    loss = loss + (
+                        anti_collapse_loss_weight
+                        * anti_collapse_loss_fn(
+                            emb_a,
+                            emb_b,
+                            lengths_a=lengths_a,
+                            lengths_b=lengths_b,
+                        )
                     )
                 val_loss += float(loss.item())
                 n_val_batches += 1
@@ -517,7 +594,10 @@ def train(
                 val_metrics=val_metrics,
                 epoch=epoch,
             )
-            for metric in _tracked_selection_metrics(selection_metric)
+            for metric in _tracked_selection_metrics(
+                selection_metric,
+                track_debug_checkpoints=track_debug_checkpoints,
+            )
         }
         current_selection = selection_snapshots[selection_metric]
         selection_key = tuple(float(value) for value in current_selection["selection_key"])
@@ -529,7 +609,7 @@ def train(
 
         logger.info(
             "Epoch %s/%s | Train: %.4f | SoftDTW: %.4f | Anchor: %.4f | "
-            "Dense: %.4f | Distill: %.4f | "
+            "Dense: %.4f | Distill: %.4f | Seq: %.4f | AntiCollapse: %.4f | "
             "Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
             "Debug AR@100: %.4f | Val MAE: %.4f | Val AR@50: %.4f | Val AR@100: %.4f | "
             "gamma: %.4f | LR: %.2e | Time: %.1fs",
@@ -540,6 +620,8 @@ def train(
             train_anchor_loss,
             train_dense_anchor_loss,
             train_path_distill_loss,
+            train_sequence_contrastive_loss,
+            train_anti_collapse_loss,
             val_loss,
             debug_metrics["mae"],
             debug_metrics["ar_50ms"],
@@ -599,12 +681,17 @@ def train(
                 "anchor_loss_weight": anchor_loss_weight,
                 "dense_anchor_loss_weight": dense_anchor_loss_weight,
                 "path_distill_loss_weight": path_distill_loss_weight,
+                "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
+                "anti_collapse_loss_weight": anti_collapse_loss_weight,
+                "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
                 "teacher_path_root": teacher_path_root,
+                "self_mined_path_root": self_mined_path_root,
                 "num_anchor_samples": num_anchor_samples,
                 "teacher_min_confidence": teacher_min_confidence,
                 "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
                 "eval_pool_size": eval_pool_size,
                 "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
+                "track_debug_checkpoints": track_debug_checkpoints,
                 "anchor_temperature": anchor_temperature,
                 "anchor_min_anchor_gap": anchor_min_anchor_gap,
             },
@@ -661,12 +748,17 @@ def train(
                         "anchor_loss_weight": anchor_loss_weight,
                         "dense_anchor_loss_weight": dense_anchor_loss_weight,
                         "path_distill_loss_weight": path_distill_loss_weight,
+                        "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
+                        "anti_collapse_loss_weight": anti_collapse_loss_weight,
+                        "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
                         "teacher_path_root": teacher_path_root,
+                        "self_mined_path_root": self_mined_path_root,
                         "num_anchor_samples": num_anchor_samples,
                         "teacher_min_confidence": teacher_min_confidence,
                         "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
                         "eval_pool_size": eval_pool_size,
                         "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
+                        "track_debug_checkpoints": track_debug_checkpoints,
                         "anchor_temperature": anchor_temperature,
                         "anchor_min_anchor_gap": anchor_min_anchor_gap,
                     },
@@ -701,6 +793,8 @@ def _empty_history() -> dict[str, list[float]]:
         "train_anchor_loss": [],
         "train_dense_anchor_loss": [],
         "train_path_distill_loss": [],
+        "train_sequence_contrastive_loss": [],
+        "train_anti_collapse_loss": [],
         "val_loss": [],
         "debug_mae": [],
         "debug_ar50": [],
@@ -816,12 +910,17 @@ def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None
     normalised.setdefault("dense_anchor_loss_weight", 0.0)
     normalised.setdefault("soft_dtw_loss_weight", 1.0)
     normalised.setdefault("path_distill_loss_weight", 0.0)
+    normalised.setdefault("sequence_contrastive_loss_weight", 0.0)
+    normalised.setdefault("anti_collapse_loss_weight", 0.0)
+    normalised.setdefault("anti_collapse_covariance_weight", 0.01)
     normalised.setdefault("teacher_path_root", None)
+    normalised.setdefault("self_mined_path_root", None)
     normalised.setdefault("num_anchor_samples", 64)
     normalised.setdefault("teacher_min_confidence", 0.0)
     normalised.setdefault("disable_time_stretch_for_anchors", True)
     normalised.setdefault("eval_pool_size", 2)
     normalised.setdefault("alignment_eval_every_n_epochs", 1)
+    normalised.setdefault("track_debug_checkpoints", True)
     return normalised
 
 
@@ -876,8 +975,12 @@ def _evaluate_swd_pairs(
     }
 
 
-def _tracked_selection_metrics(selection_metric: str) -> tuple[str, ...]:
-    ordered = list(TRACKED_SELECTION_METRICS)
+def _tracked_selection_metrics(
+    selection_metric: str,
+    *,
+    track_debug_checkpoints: bool = True,
+) -> tuple[str, ...]:
+    ordered = list(TRACKED_SELECTION_METRICS) if track_debug_checkpoints else []
     if selection_metric not in ordered:
         ordered.append(selection_metric)
     return tuple(ordered)
@@ -999,18 +1102,24 @@ def _validate_headline_claim_config(config: dict[str, Any], *, path: str | None 
     evaluation_cfg = config.get("evaluation", {})
     errors: list[str] = []
 
-    if dataset_cfg.get("segment_sampling") != "teacher_path":
-        errors.append("dataset.segment_sampling must be 'teacher_path'")
+    strict_sampling_modes = {"self_audio", "same_lied_pair", "self_mined_path"}
+    if dataset_cfg.get("segment_sampling") not in strict_sampling_modes:
+        errors.append("dataset.segment_sampling must be one of {'self_audio', 'same_lied_pair', 'self_mined_path'}")
 
     for key in ("anchor_loss_weight", "dense_anchor_loss_weight"):
         if float(training_cfg.get(key, 0.0) or 0.0) > 0.0:
             errors.append(f"training.{key} must be 0 for the headline claim")
 
     teacher_root = str(training_cfg.get("teacher_path_root", "") or "").lower()
-    if not teacher_root:
-        errors.append("training.teacher_path_root is required for headline teacher distillation")
-    if "anchor_calibrated" in teacher_root or "calibrated" in teacher_root:
-        errors.append("training.teacher_path_root must not point at calibrated/anchor artifacts")
+    if teacher_root:
+        errors.append("training.teacher_path_root must be empty for the strict headline claim")
+    if dataset_cfg.get("segment_sampling") == "self_mined_path" and not training_cfg.get("self_mined_path_root"):
+        errors.append("training.self_mined_path_root is required for self_mined_path sampling")
+    selection_metric = str(training_cfg.get("selection_metric", "val_loss"))
+    if selection_metric != "val_loss":
+        errors.append("training.selection_metric must be 'val_loss' for strict headline checkpoint selection")
+    if bool(training_cfg.get("track_debug_checkpoints", False)):
+        errors.append("training.track_debug_checkpoints must be false for strict headline checkpoint selection")
 
     if evaluation_cfg.get("deep_decode", "unconstrained") != "unconstrained":
         errors.append("evaluation.deep_decode must be 'unconstrained'")
@@ -1207,9 +1316,29 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("path_distill_loss_weight"),
             0.0,
         ),
+        "sequence_contrastive_loss_weight": _resolve_option(
+            getattr(args, "sequence_contrastive_loss_weight", None),
+            training_cfg.get("sequence_contrastive_loss_weight"),
+            0.0,
+        ),
+        "anti_collapse_loss_weight": _resolve_option(
+            getattr(args, "anti_collapse_loss_weight", None),
+            training_cfg.get("anti_collapse_loss_weight"),
+            0.0,
+        ),
+        "anti_collapse_covariance_weight": _resolve_option(
+            getattr(args, "anti_collapse_covariance_weight", None),
+            training_cfg.get("anti_collapse_covariance_weight"),
+            0.01,
+        ),
         "teacher_path_root": _resolve_option(
             args.teacher_path_root,
             training_cfg.get("teacher_path_root"),
+            None,
+        ),
+        "self_mined_path_root": _resolve_option(
+            getattr(args, "self_mined_path_root", None),
+            training_cfg.get("self_mined_path_root"),
             None,
         ),
         "num_anchor_samples": _resolve_option(
@@ -1236,6 +1365,11 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             args.alignment_eval_every_n_epochs,
             evaluation_cfg.get("alignment_eval_every_n_epochs"),
             1,
+        ),
+        "track_debug_checkpoints": _resolve_option(
+            getattr(args, "track_debug_checkpoints", None),
+            training_cfg.get("track_debug_checkpoints"),
+            True,
         ),
         "anchor_temperature": _resolve_option(
             args.anchor_temperature,
@@ -1272,7 +1406,7 @@ def main() -> None:
     parser.add_argument(
         "--segment-sampling",
         type=str,
-        choices=["aligned_measures", "independent_random", "teacher_path", "self_audio"],
+        choices=["aligned_measures", "independent_random", "teacher_path", "self_audio", "same_lied_pair", "self_mined_path"],
         default=None,
     )
     parser.add_argument("--samples-per-epoch", type=int, default=None)
@@ -1298,7 +1432,11 @@ def main() -> None:
     parser.add_argument("--anchor-loss-weight", type=float, default=None)
     parser.add_argument("--dense-anchor-loss-weight", type=float, default=None)
     parser.add_argument("--path-distill-loss-weight", type=float, default=None)
+    parser.add_argument("--sequence-contrastive-loss-weight", type=float, default=None)
+    parser.add_argument("--anti-collapse-loss-weight", type=float, default=None)
+    parser.add_argument("--anti-collapse-covariance-weight", type=float, default=None)
     parser.add_argument("--teacher-path-root", type=str, default=None)
+    parser.add_argument("--self-mined-path-root", type=str, default=None)
     parser.add_argument("--num-anchor-samples", type=int, default=None)
     parser.add_argument("--teacher-min-confidence", type=float, default=None)
     parser.add_argument(
@@ -1313,6 +1451,9 @@ def main() -> None:
     )
     parser.add_argument("--eval-pool-size", type=int, default=None)
     parser.add_argument("--alignment-eval-every-n-epochs", type=int, default=None)
+    parser.add_argument("--track-debug-checkpoints", dest="track_debug_checkpoints", action="store_true")
+    parser.add_argument("--no-track-debug-checkpoints", dest="track_debug_checkpoints", action="store_false")
+    parser.set_defaults(track_debug_checkpoints=None)
     parser.add_argument("--anchor-temperature", type=float, default=None)
     parser.add_argument("--anchor-min-anchor-gap", type=int, default=None)
     parser.add_argument("--no-augment", action="store_true")

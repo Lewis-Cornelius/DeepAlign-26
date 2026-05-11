@@ -1,17 +1,16 @@
-# Diagnostic-only audio-teacher route for DeepAlign with unconstrained DTW.
+# Strict headline Stage 3: distill paths mined from learned DeepAlign itself.
 #
-# This config is not headline-eligible for the strict initial claim because it
-# trains from hand-crafted audio-teacher paths.
+# This stage may run only after Stage 2 passes the 8-lied gate.
 
 claim:
-  name: diagnostic_audio_teacher_unconstrained
-  headline: false
+  name: initial_audio_only_unconstrained
+  headline: true
 
 dataset:
   swd_path: null
-  max_length_sec: 12.0
-  segment_sampling: teacher_path
-  samples_per_epoch: 384
+  max_length_sec: 4.0
+  segment_sampling: self_mined_path
+  samples_per_epoch: 128
   cache_spectrograms: true
   cache_root: .cache/cqt
   debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
@@ -33,27 +32,32 @@ model:
   temporal_attention_heads: 0
 
 training:
-  epochs: 36
+  epochs: 16
   batch_size: 3
-  lr: 0.0001
+  lr: 0.00003
   weight_decay: 0.0001
   gradient_clip: 1.0
-  resume_from: checkpoints/initial_claim_self_audio_pretrain/best_model.pt
-  selection_metric: debug_ar50
+  resume_from: checkpoints/initial_claim_strict_pair_stage2/best_model.pt
+  selection_metric: val_loss
+  track_debug_checkpoints: false
   anchor_loss_weight: 0.0
   dense_anchor_loss_weight: 0.0
-  path_distill_loss_weight: 1.0
-  teacher_path_root: results/teacher_initial_claim_audio_only/paths
-  teacher_min_confidence: 0.60
+  path_distill_loss_weight: 0.5
+  sequence_contrastive_loss_weight: 0.5
+  anti_collapse_loss_weight: 0.05
+  anti_collapse_covariance_weight: 0.01
+  teacher_path_root: null
+  self_mined_path_root: results/self_mined_initial_claim_strict_stage2/paths
+  teacher_min_confidence: 0.0
   num_anchor_samples: 128
   disable_time_stretch_for_anchors: true
-  anchor_temperature: 0.05
+  anchor_temperature: 0.07
   anchor_min_anchor_gap: 3
 
 soft_dtw:
-  loss_weight: 0.15
-  start_gamma: 0.1
-  end_gamma: 0.01
+  loss_weight: 0.01
+  start_gamma: 0.08
+  end_gamma: 0.02
   normalize: true
   dist_func: sqeuclidean
 
@@ -69,7 +73,8 @@ evaluation:
   deep_distance: sqeuclidean
   pool_size: 1
   band_radius_frames: null
+  alignment_eval_every_n_epochs: 0
 
 output:
-  checkpoint_dir: checkpoints/initial_claim_audio_only_unconstrained
+  checkpoint_dir: checkpoints/initial_claim_strict_selfmine_stage3
   save_every_n_epochs: 1

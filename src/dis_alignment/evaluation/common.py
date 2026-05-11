@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import time
 import xml.etree.ElementTree as ET
+import tempfile
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
+from numba import njit
 
 from dis_alignment.alignment.matchmaker import MatchmakerResult, run_matchmaker
 from dis_alignment.alignment.multiscale_dtw import align_mrmsdtw
@@ -39,6 +42,9 @@ DEEP_VARIANT_COLUMNS = (
     "score_refine_radius_sec",
 )
 METHOD_VARIANT_COLUMN = "method_variant"
+MEMORY_EFFICIENT_DTW_MIN_BYTES = 4 * 1024 * 1024 * 1024
+MEMORY_EFFICIENT_DTW_CHUNK_BYTES = 96 * 1024 * 1024
+MEMORY_EFFICIENT_DTW_MEMMAP_CELLS = 512_000_000
 
 
 def parse_methods(
@@ -124,12 +130,167 @@ def fast_dtw_align(
     import librosa
 
     start = time.perf_counter()
+    n_frames_a = int(features_a.shape[1])
+    n_frames_b = int(features_b.shape[1])
+    if _should_use_memory_efficient_dtw(n_frames_a, n_frames_b, distance):
+        return _memory_efficient_dtw_align(features_a, features_b, distance=distance)
+
     cost_matrix = cdist(features_a.T, features_b.T, metric=distance).astype(np.float64)
     cost_matrix = np.nan_to_num(cost_matrix, nan=1.0, posinf=1e6, neginf=1e6)
     accumulated_cost, warping_path = librosa.sequence.dtw(C=cost_matrix, backtrack=True)
     path = warping_path[::-1].T.astype(np.intp)
     runtime = time.perf_counter() - start
     return path, float(accumulated_cost[-1, -1]), runtime
+
+
+def _should_use_memory_efficient_dtw(n_frames_a: int, n_frames_b: int, distance: str) -> bool:
+    """Return True when librosa DTW would require an unsafe dense matrix budget."""
+    if distance not in {"cosine", "sqeuclidean"}:
+        return False
+    estimated_bytes = int(n_frames_a) * int(n_frames_b) * 16
+    return estimated_bytes >= MEMORY_EFFICIENT_DTW_MIN_BYTES
+
+
+def _memory_efficient_dtw_align(
+    features_a: np.ndarray,
+    features_b: np.ndarray,
+    *,
+    distance: str = "cosine",
+) -> tuple[np.ndarray, float, float]:
+    """Full unconstrained DTW with rolling cost rows and compact backpointers."""
+    if distance not in {"cosine", "sqeuclidean"}:
+        raise ValueError(f"Memory-efficient DTW does not support distance={distance!r}")
+
+    start = time.perf_counter()
+    x = np.asarray(features_a.T, dtype=np.float32, order="C")
+    y = np.asarray(features_b.T, dtype=np.float32, order="C")
+    if distance == "cosine":
+        x = _row_normalize(x)
+        y = _row_normalize(y)
+        y_norm_sq = None
+    else:
+        y_norm_sq = np.einsum("ij,ij->i", y, y, dtype=np.float64).astype(np.float32)
+
+    n_rows, n_cols = x.shape[0], y.shape[0]
+    directions, direction_path = _allocate_direction_matrix(n_rows, n_cols)
+    prev = np.full(n_cols + 1, np.inf, dtype=np.float64)
+    curr = np.full(n_cols + 1, np.inf, dtype=np.float64)
+    prev[0] = 0.0
+
+    rows_per_chunk = max(1, int(MEMORY_EFFICIENT_DTW_CHUNK_BYTES // max(n_cols * 4, 1)))
+    try:
+        for start_row in range(0, n_rows, rows_per_chunk):
+            end_row = min(start_row + rows_per_chunk, n_rows)
+            costs = _pairwise_cost_block(
+                x[start_row:end_row],
+                y,
+                distance=distance,
+                y_norm_sq=y_norm_sq,
+            )
+            np.nan_to_num(costs, copy=False, nan=1.0, posinf=1e6, neginf=1e6)
+            _accumulate_dtw_chunk(costs, prev, curr, directions[start_row:end_row])
+
+        path = _backtrack_direction_matrix(directions, n_rows, n_cols)
+        runtime = time.perf_counter() - start
+        return path, float(prev[n_cols]), runtime
+    finally:
+        if direction_path is not None:
+            del directions
+            try:
+                os.remove(direction_path)
+            except OSError:
+                pass
+
+
+def _allocate_direction_matrix(
+    n_rows: int,
+    n_cols: int,
+) -> tuple[np.ndarray, str | None]:
+    cells = int(n_rows) * int(n_cols)
+    if cells >= MEMORY_EFFICIENT_DTW_MEMMAP_CELLS:
+        handle = tempfile.NamedTemporaryFile(prefix="deepalign_dtw_steps_", suffix=".dat", delete=False)
+        path = handle.name
+        handle.close()
+        return np.memmap(path, mode="w+", dtype=np.uint8, shape=(n_rows, n_cols)), path
+    return np.empty((n_rows, n_cols), dtype=np.uint8), None
+
+
+def _row_normalize(values: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    return values / np.maximum(norms, eps)
+
+
+def _pairwise_cost_block(
+    x_block: np.ndarray,
+    y: np.ndarray,
+    *,
+    distance: str,
+    y_norm_sq: np.ndarray | None,
+) -> np.ndarray:
+    dots = x_block @ y.T
+    if distance == "cosine":
+        costs = 1.0 - dots
+    else:
+        x_norm_sq = np.einsum("ij,ij->i", x_block, x_block, dtype=np.float64).astype(np.float32)
+        costs = x_norm_sq[:, None] + y_norm_sq[None, :] - (2.0 * dots)
+    return np.maximum(costs, 0.0).astype(np.float32, copy=False)
+
+
+@njit(cache=True)
+def _accumulate_dtw_chunk(
+    costs: np.ndarray,
+    prev: np.ndarray,
+    curr: np.ndarray,
+    directions: np.ndarray,
+) -> None:
+    n_rows, n_cols = costs.shape
+    inf = np.inf
+    for i in range(n_rows):
+        curr[0] = inf
+        for j in range(1, n_cols + 1):
+            diag = prev[j - 1]
+            up = prev[j]
+            left = curr[j - 1]
+            best = diag
+            direction = 0
+            if up < best:
+                best = up
+                direction = 1
+            if left < best:
+                best = left
+                direction = 2
+            curr[j] = costs[i, j - 1] + best
+            directions[i, j - 1] = direction
+        for j in range(n_cols + 1):
+            prev[j] = curr[j]
+
+
+def _backtrack_direction_matrix(
+    directions: np.ndarray,
+    n_rows: int,
+    n_cols: int,
+) -> np.ndarray:
+    i = n_rows - 1
+    j = n_cols - 1
+    path: list[tuple[int, int]] = []
+    while True:
+        path.append((i, j))
+        if i == 0 and j == 0:
+            break
+        direction = int(directions[i, j])
+        if direction == 0:
+            i -= 1
+            j -= 1
+        elif direction == 1:
+            i -= 1
+        else:
+            j -= 1
+        if i < 0:
+            i = 0
+        if j < 0:
+            j = 0
+    path.reverse()
+    return np.asarray(path, dtype=np.intp).T
 
 
 def banded_dtw_align(
