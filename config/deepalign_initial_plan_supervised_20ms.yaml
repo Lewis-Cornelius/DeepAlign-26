@@ -12,8 +12,8 @@ claim:
 dataset:
   swd_path: null
   max_length_sec: 2.0
-  segment_sampling: teacher_path
-  samples_per_epoch: 256
+  segment_sampling: aligned_measures
+  samples_per_epoch: 128
   cache_spectrograms: true
   cache_root: .cache/cqt
   debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
@@ -35,18 +35,18 @@ model:
   temporal_attention_heads: 0
 
 training:
-  epochs: 8
+  epochs: 1
   batch_size: 4
-  lr: 0.00005
+  lr: 0.00001
   weight_decay: 0.0001
   gradient_clip: 1.0
   resume_from: checkpoints/initial_claim_self_audio_pretrain/best_model.pt
   selection_metric: debug_balanced
   track_debug_checkpoints: true
   anchor_loss_weight: 0.1
-  dense_anchor_loss_weight: 0.2
-  path_distill_loss_weight: 1.0
-  sequence_contrastive_loss_weight: 0.2
+  dense_anchor_loss_weight: 0.3
+  path_distill_loss_weight: 2.0
+  sequence_contrastive_loss_weight: 0.0
   anti_collapse_loss_weight: 0.05
   anti_collapse_covariance_weight: 0.01
   temporal_order_loss_weight: 0.0
@@ -62,14 +62,16 @@ training:
   memory_bank_size: 0
   teacher_path_root: results/teacher_target_20ms/paths
   self_mined_path_root: null
-  teacher_min_confidence: 0.0
+  teacher_min_confidence: 0.5
   num_anchor_samples: 128
+  path_distill_local_radius_frames: 12
+  path_distill_local_step_frames: 1
   disable_time_stretch_for_anchors: true
   anchor_temperature: 0.05
-  anchor_min_anchor_gap: 3
+  anchor_min_anchor_gap: 1
 
 soft_dtw:
-  loss_weight: 0.02
+  loss_weight: 0.005
   start_gamma: 0.1
   end_gamma: 0.01
   normalize: true

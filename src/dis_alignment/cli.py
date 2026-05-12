@@ -695,6 +695,8 @@ def _row_costs(query, candidates, *, distance: str):
 @click.option("--self-mined-path-root", type=click.Path(), default=None, help="Directory containing model self-mined path NPZ files")
 @click.option("--num-anchor-samples", type=int, default=None, help="Teacher path samples per aligned crop")
 @click.option("--teacher-min-confidence", type=float, default=None, help="Minimum teacher confidence for distillation samples")
+@click.option("--path-distill-local-radius-frames", type=int, default=None, help="Local negative radius for teacher-path distillation")
+@click.option("--path-distill-local-step-frames", type=int, default=None, help="Local negative step for teacher-path distillation")
 @click.option(
     "--disable-time-stretch-for-anchors/--allow-time-stretch-for-anchors",
     default=None,
@@ -754,6 +756,8 @@ def train(
     self_mined_path_root: str | None,
     num_anchor_samples: int | None,
     teacher_min_confidence: float | None,
+    path_distill_local_radius_frames: int | None,
+    path_distill_local_step_frames: int | None,
     disable_time_stretch_for_anchors: bool | None,
     eval_pool_size: int | None,
     alignment_eval_every_n_epochs: int | None,
@@ -868,6 +872,16 @@ def train(
         self_mined_path_root=_coalesce(self_mined_path_root, training_cfg.get("self_mined_path_root"), None),
         num_anchor_samples=_coalesce(num_anchor_samples, training_cfg.get("num_anchor_samples"), 64),
         teacher_min_confidence=_coalesce(teacher_min_confidence, training_cfg.get("teacher_min_confidence"), 0.0),
+        path_distill_local_radius_frames=_coalesce(
+            path_distill_local_radius_frames,
+            training_cfg.get("path_distill_local_radius_frames"),
+            12,
+        ),
+        path_distill_local_step_frames=_coalesce(
+            path_distill_local_step_frames,
+            training_cfg.get("path_distill_local_step_frames"),
+            3,
+        ),
         disable_time_stretch_for_anchors=_coalesce(
             disable_time_stretch_for_anchors,
             training_cfg.get("disable_time_stretch_for_anchors"),

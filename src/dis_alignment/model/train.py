@@ -170,6 +170,8 @@ def train(
     self_mined_path_root: str | None = None,
     num_anchor_samples: int = 64,
     teacher_min_confidence: float = 0.0,
+    path_distill_local_radius_frames: int = 12,
+    path_distill_local_step_frames: int = 3,
     disable_time_stretch_for_anchors: bool = True,
     eval_pool_size: int = 2,
     alignment_eval_every_n_epochs: int = 1,
@@ -294,7 +296,9 @@ def train(
             deterministic=True,
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
-            teacher_path_root=teacher_path_root if segment_sampling == "teacher_path" else None,
+            teacher_path_root=teacher_path_root
+            if (segment_sampling == "teacher_path" or path_distill_loss_weight > 0)
+            else None,
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
@@ -363,7 +367,12 @@ def train(
         else None
     )
     path_distill_loss_fn = (
-        PathDistillationLoss(temperature=anchor_temperature, min_anchor_gap=anchor_min_anchor_gap).to(dev)
+        PathDistillationLoss(
+            temperature=anchor_temperature,
+            min_anchor_gap=anchor_min_anchor_gap,
+            local_radius=path_distill_local_radius_frames,
+            local_step=path_distill_local_step_frames,
+        ).to(dev)
         if path_distill_loss_weight > 0
         else None
     )
@@ -459,6 +468,8 @@ def train(
         "self_mined_path_root": str(self_mined_path_root) if self_mined_path_root is not None else None,
         "num_anchor_samples": num_anchor_samples,
         "teacher_min_confidence": teacher_min_confidence,
+        "path_distill_local_radius_frames": path_distill_local_radius_frames,
+        "path_distill_local_step_frames": path_distill_local_step_frames,
         "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
         "eval_pool_size": eval_pool_size,
         "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
@@ -1002,6 +1013,8 @@ def train(
                 "self_mined_path_root": self_mined_path_root,
                 "num_anchor_samples": num_anchor_samples,
                 "teacher_min_confidence": teacher_min_confidence,
+                "path_distill_local_radius_frames": path_distill_local_radius_frames,
+                "path_distill_local_step_frames": path_distill_local_step_frames,
                 "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
                 "eval_pool_size": eval_pool_size,
                 "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
@@ -1081,6 +1094,8 @@ def train(
                         "self_mined_path_root": self_mined_path_root,
                         "num_anchor_samples": num_anchor_samples,
                         "teacher_min_confidence": teacher_min_confidence,
+                        "path_distill_local_radius_frames": path_distill_local_radius_frames,
+                        "path_distill_local_step_frames": path_distill_local_step_frames,
                         "disable_time_stretch_for_anchors": disable_time_stretch_for_anchors,
                         "eval_pool_size": eval_pool_size,
                         "alignment_eval_every_n_epochs": alignment_eval_every_n_epochs,
@@ -1268,6 +1283,8 @@ def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None
     normalised.setdefault("self_mined_path_root", None)
     normalised.setdefault("num_anchor_samples", 64)
     normalised.setdefault("teacher_min_confidence", 0.0)
+    normalised.setdefault("path_distill_local_radius_frames", 12)
+    normalised.setdefault("path_distill_local_step_frames", 3)
     normalised.setdefault("disable_time_stretch_for_anchors", True)
     normalised.setdefault("eval_pool_size", 2)
     normalised.setdefault("alignment_eval_every_n_epochs", 1)
@@ -1760,6 +1777,16 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("teacher_min_confidence"),
             0.0,
         ),
+        "path_distill_local_radius_frames": _resolve_option(
+            getattr(args, "path_distill_local_radius_frames", None),
+            training_cfg.get("path_distill_local_radius_frames"),
+            12,
+        ),
+        "path_distill_local_step_frames": _resolve_option(
+            getattr(args, "path_distill_local_step_frames", None),
+            training_cfg.get("path_distill_local_step_frames"),
+            3,
+        ),
         "disable_time_stretch_for_anchors": _resolve_option(
             args.disable_time_stretch_for_anchors,
             training_cfg.get("disable_time_stretch_for_anchors"),
@@ -1867,6 +1894,8 @@ def main() -> None:
     parser.add_argument("--self-mined-path-root", type=str, default=None)
     parser.add_argument("--num-anchor-samples", type=int, default=None)
     parser.add_argument("--teacher-min-confidence", type=float, default=None)
+    parser.add_argument("--path-distill-local-radius-frames", type=int, default=None)
+    parser.add_argument("--path-distill-local-step-frames", type=int, default=None)
     parser.add_argument(
         "--disable-time-stretch-for-anchors",
         dest="disable_time_stretch_for_anchors",

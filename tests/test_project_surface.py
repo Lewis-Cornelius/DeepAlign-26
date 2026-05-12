@@ -169,13 +169,21 @@ def test_original_plan_supervised_route_keeps_20ms_target():
     soft_dtw = config["soft_dtw"]
     evaluation = config["evaluation"]
 
-    assert config["dataset"]["segment_sampling"] == "teacher_path"
+    assert config["dataset"]["segment_sampling"] == "aligned_measures"
+    assert config["dataset"]["samples_per_epoch"] == 128
     assert training["teacher_path_root"] == "results/teacher_target_20ms/paths"
+    assert training["epochs"] == 1
+    assert training["lr"] == 0.00001
     assert training["selection_metric"] == "debug_balanced"
     assert training["track_debug_checkpoints"] is True
     assert training["path_distill_loss_weight"] > 0.0
     assert training["dense_anchor_loss_weight"] > 0.0
+    assert training["sequence_contrastive_loss_weight"] == 0.0
+    assert training["teacher_min_confidence"] == 0.5
+    assert training["path_distill_local_step_frames"] == 1
+    assert training["anchor_min_anchor_gap"] == 1
     assert soft_dtw["loss_weight"] > 0.0
+    assert soft_dtw["loss_weight"] <= 0.005
     assert evaluation["deep_decode"] == "unconstrained"
     assert evaluation["pool_size"] == 1
     assert evaluation["alignment_eval_every_n_epochs"] == 1

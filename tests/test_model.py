@@ -1329,6 +1329,8 @@ class TestTrainingPairSplit:
             "  teacher_path_root: results/teacher/paths\n"
             "  num_anchor_samples: 96\n"
             "  teacher_min_confidence: 0.6\n"
+            "  path_distill_local_radius_frames: 10\n"
+            "  path_distill_local_step_frames: 2\n"
             "  disable_time_stretch_for_anchors: true\n"
             "soft_dtw:\n"
             "  loss_weight: 0.0\n"
@@ -1376,6 +1378,8 @@ class TestTrainingPairSplit:
             teacher_path_root=None,
             num_anchor_samples=None,
             teacher_min_confidence=None,
+            path_distill_local_radius_frames=None,
+            path_distill_local_step_frames=None,
             disable_time_stretch_for_anchors=None,
             eval_pool_size=None,
             alignment_eval_every_n_epochs=None,
@@ -1395,6 +1399,8 @@ class TestTrainingPairSplit:
         assert kwargs["teacher_path_root"] == "results/teacher/paths"
         assert kwargs["num_anchor_samples"] == 96
         assert kwargs["teacher_min_confidence"] == pytest.approx(0.6)
+        assert kwargs["path_distill_local_radius_frames"] == 10
+        assert kwargs["path_distill_local_step_frames"] == 2
         assert kwargs["disable_time_stretch_for_anchors"] is True
         assert kwargs["eval_pool_size"] == 1
         assert kwargs["alignment_eval_every_n_epochs"] == 0
