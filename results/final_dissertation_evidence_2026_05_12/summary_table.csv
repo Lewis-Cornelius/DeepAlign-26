@@ -1,0 +1,6 @@
+evidence,pairs,mae_ms,median_ae_ms,ar50_pct,interpretation
+Teacher route,24,18.935513888840518,0.033914588996222794,98.3820620157887,Target is reachable with dense supervised timing.
+Best learned student,8,112.04829912202472,31.19897948696201,69.24564747761812,Student learns local timing but not robust route control.
+Best AR/p90 probe,8,113.209119073625,30.787981818953,69.94709347927876,Similar learned-decoder ceiling with slightly higher AR.
+Coarse-to-fine fused,8,116.91117972738164,28.416241620253533,67.43479987779588,Guided decoder improves some pairs but hurts others.
+Oracle decoder selector,8,91.76860011684452,,72.09598680914412,Decoder complementarity helps but remains far from target.

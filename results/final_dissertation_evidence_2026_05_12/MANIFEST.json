@@ -1,0 +1,160 @@
+{
+  "package": "final_dissertation_evidence_2026_05_12",
+  "git_commit": "2514c56576f1328551cebb32609d84f51a7e30b6",
+  "created_local_date": "2026-05-12",
+  "summary": [
+    {
+      "evidence": "Teacher route",
+      "pairs": 24,
+      "mae_ms": 18.935513888840518,
+      "median_ae_ms": 0.033914588996222794,
+      "ar50_pct": 98.3820620157887,
+      "interpretation": "Target is reachable with dense supervised timing."
+    },
+    {
+      "evidence": "Best learned student",
+      "pairs": 8,
+      "mae_ms": 112.04829912202472,
+      "median_ae_ms": 31.19897948696201,
+      "ar50_pct": 69.24564747761812,
+      "interpretation": "Student learns local timing but not robust route control."
+    },
+    {
+      "evidence": "Best AR/p90 probe",
+      "pairs": 8,
+      "mae_ms": 113.209119073625,
+      "median_ae_ms": 30.787981818953,
+      "ar50_pct": 69.94709347927876,
+      "interpretation": "Similar learned-decoder ceiling with slightly higher AR."
+    },
+    {
+      "evidence": "Coarse-to-fine fused",
+      "pairs": 8,
+      "mae_ms": 116.91117972738164,
+      "median_ae_ms": 28.416241620253533,
+      "ar50_pct": 67.43479987779588,
+      "interpretation": "Guided decoder improves some pairs but hurts others."
+    },
+    {
+      "evidence": "Oracle decoder selector",
+      "pairs": 8,
+      "mae_ms": 91.76860011684452,
+      "median_ae_ms": NaN,
+      "ar50_pct": 72.09598680914412,
+      "interpretation": "Decoder complementarity helps but remains far from target."
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\checkpoints\\best_ar_p90_balanced.pt",
+      "bytes": 13804900,
+      "sha256": "3d491c7244241e41cc537451e6ca331a05ed889d950af313642aa5b2a8dcb541"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\checkpoints\\best_student_debug_mae.pt",
+      "bytes": 13805045,
+      "sha256": "7b77294f113c603eb34dd0464db2fdb24ec95a2d0cd1bc4ca3c178b091f27916"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\checkpoints\\local_transfer_balanced.pt",
+      "bytes": 13804324,
+      "sha256": "90692c95580a72bf41f3047d80148b64dcc7ff07011f7843c558927d5682c220"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\configs\\deepalign_initial_plan_supervised_20ms.yaml",
+      "bytes": 2555,
+      "sha256": "ed8b70c04c02ca5338609b35f1cc87a047b318cd669443662024b40a54fadc3c"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\configs\\deepalign_initial_plan_supervised_false_dest_replay_stage3.yaml",
+      "bytes": 2903,
+      "sha256": "18ab3910de54b97ae69cec049b52cc7930a6f07509c94d33d3b094714d56a2d5"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\configs\\deepalign_initial_plan_supervised_false_dest_stage2.yaml",
+      "bytes": 2853,
+      "sha256": "5c98ed768591645d379e3d21a9a8df2f09240e120e5914ddeaefe23e42a302ec"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\configs\\deepalign_initial_plan_supervised_global_stage2.yaml",
+      "bytes": 2725,
+      "sha256": "72d637c93fa2a9508cd4c30c2e22632b55fb79989e5a18d9d2217613b5ea09e4"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\configs\\deepalign_initial_plan_supervised_repeated_neg_stage2.yaml",
+      "bytes": 2734,
+      "sha256": "4f40e875f7612d0fb40348c2dd6a297d66deb41db6599de83d77b0c602340996"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\best_ar_p90_probe.csv",
+      "bytes": 2472,
+      "sha256": "e135f378419fee2a984022018f882b452bf7eaad847bacb140641d090aaea1bd"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\best_student_gate.csv",
+      "bytes": 2501,
+      "sha256": "a3a8644ca1e5ba0ecc713d6266deec1c64c1ef94a997405ae1b8d481a2e6b158"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\coarse_to_fine_fused_r050.csv",
+      "bytes": 2646,
+      "sha256": "9ce77c29cb4c61b40237a5420b71d56329f5edbe46211da4ea2a31c4e453e901"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\event_errors_best_student.csv",
+      "bytes": 92804,
+      "sha256": "a5aef622ecd1f50ddecdf633939c742e6c810728952a57b6501aef3c8a9f4156"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\failure_report_best_student.csv",
+      "bytes": 3922,
+      "sha256": "be3668ce5d9d13375bac3275b5197ebb9ef6222f497a0480b255500de21bb147"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\local_transfer_baseline.csv",
+      "bytes": 2492,
+      "sha256": "42c157b4a0d1d455d3c6b3b2048edac1ae43bb3efd8e933be670e0b68f7559a1"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\selector_oracle_comparison.csv",
+      "bytes": 4544,
+      "sha256": "9b4c06f9a1b6cc2021857ee64bbd31c6a3568f07d73fbd61ba3b6c4254839856"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\selector_rule_evaluation.csv",
+      "bytes": 5394,
+      "sha256": "e284aeff09c3b440ff3e7cb4bd38119e070f963aec9b599c93a397df359a25a0"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\teacher_manifest.json",
+      "bytes": 8225,
+      "sha256": "235bb1f8b15470cc1e1de2c1d9006d2dab3c7e759e85bcefaad9a73d08619012"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\teacher_oracle_results.csv",
+      "bytes": 2804,
+      "sha256": "b044675de00b3e5e40c17cd7657e7761957bc5c3ed54e9abbf694034c0c63e9f"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\csv\\teacher_results.csv",
+      "bytes": 4975,
+      "sha256": "5a2ce8e62e42af646c9c8c607ce56eb7908872a6d3835ef709adc6a36ad23597"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\summary_table.csv",
+      "bytes": 707,
+      "sha256": "f6c643e246d384876f3360b06813e207f32db69e9f2c0a1cf1d03f9846349d26"
+    },
+    {
+      "path": "results\\final_dissertation_evidence_2026_05_12\\summary_table.md",
+      "bytes": 677,
+      "sha256": "85661e52c9b8b41a2005a5a2c101ce5c8d08b293bdf9c73204f23b1bcad3741a"
+    }
+  ],
+  "figures": [
+    "figures\\final_dissertation_evidence_2026_05_12\\event_error_boxplot.png",
+    "figures\\final_dissertation_evidence_2026_05_12\\evidence_metric_comparison.png",
+    "figures\\final_dissertation_evidence_2026_05_12\\per_lied_failure_metrics.png",
+    "figures\\final_dissertation_evidence_2026_05_12\\route_excursion_case_study.png"
+  ]
+}

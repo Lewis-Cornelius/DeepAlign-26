@@ -1,0 +1,99 @@
+# Original-plan supervised global path-control stage.
+#
+# Stage 1 local transfer gets many points locally right, but the unconstrained
+# path still makes large excursions. This stage resumes from that local-transfer
+# checkpoint, uses longer aligned-measure crops, and adds full-crop soft teacher
+# path distillation to teach route shape without changing final inference.
+
+claim:
+  name: initial_plan_supervised_softdtw_global_stage2
+  headline: false
+
+dataset:
+  swd_path: null
+  max_length_sec: 4.0
+  segment_sampling: aligned_measures
+  samples_per_epoch: 512
+  cache_spectrograms: true
+  cache_root: .cache/cqt
+  debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
+  val_split: 0.2
+  performances: null
+
+audio:
+  sr: 22050
+  hop_length: 110
+  n_bins: 84
+  bins_per_octave: 12
+
+model:
+  embed_dim: 64
+  conv_channels: [32, 64, 128, 128]
+  gru_hidden_size: 128
+  num_gru_layers: 2
+  dropout: 0.1
+  temporal_attention_heads: 0
+
+training:
+  epochs: 8
+  batch_size: 2
+  lr: 0.000005
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  resume_from: checkpoints/initial_plan_supervised_20ms/best_model_balanced.pt
+  selection_metric: debug_balanced
+  track_debug_checkpoints: true
+  anchor_loss_weight: 0.1
+  dense_anchor_loss_weight: 0.3
+  path_distill_loss_weight: 2.0
+  soft_path_distill_loss_weight: 0.3
+  soft_path_temperature: 0.05
+  soft_path_target_sigma_frames: 2.0
+  sequence_contrastive_loss_weight: 0.0
+  anti_collapse_loss_weight: 0.05
+  anti_collapse_covariance_weight: 0.01
+  temporal_order_loss_weight: 0.0
+  relative_offset_loss_weight: 0.0
+  relative_offset_bins: [8, 24, 64, 128]
+  masked_reconstruction_loss_weight: 0.0
+  cycle_consistency_loss_weight: 0.0
+  cycle_entropy_loss_weight: 0.0
+  cycle_monotonicity_loss_weight: 0.0
+  cycle_smoothness_loss_weight: 0.0
+  hard_negative_loss_weight: 0.0
+  hard_negative_radius_frames: 128
+  memory_bank_size: 0
+  teacher_path_root: results/teacher_target_20ms/paths
+  self_mined_path_root: null
+  teacher_min_confidence: 0.5
+  num_anchor_samples: 192
+  path_distill_local_radius_frames: 24
+  path_distill_local_step_frames: 1
+  disable_time_stretch_for_anchors: true
+  anchor_temperature: 0.05
+  anchor_min_anchor_gap: 1
+
+soft_dtw:
+  loss_weight: 0.002
+  start_gamma: 0.1
+  end_gamma: 0.03
+  normalize: true
+  dist_func: sqeuclidean
+
+augmentation:
+  enabled: false
+  time_stretch_range: [1.0, 1.0]
+  pitch_shift_range: [-1, 1]
+  noise_snr_range: [25.0, 45.0]
+  augment_prob: 0.0
+
+evaluation:
+  deep_decode: unconstrained
+  deep_distance: sqeuclidean
+  pool_size: 1
+  band_radius_frames: null
+  alignment_eval_every_n_epochs: 1
+
+output:
+  checkpoint_dir: checkpoints/initial_plan_supervised_global_stage2
+  save_every_n_epochs: 1
