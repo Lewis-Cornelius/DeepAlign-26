@@ -153,20 +153,38 @@ The default success criteria checked by the CLI target the `deepalign` method:
 - `MAE < 20 ms`
 - `AR@50ms > 98%`
 
-## Current Best SWD Evidence
+## Current Dissertation Evidence
 
-As of 2026-04-27, the strongest SWD result in this checkout is:
+As of 2026-05-12, the strongest evidence package is the recovered
+original-plan supervised route, not the older transcription-fused package. The
+current dissertation-shaped result is:
 
-- Results CSV: `results/swd_evaluation_transcription_fused_2026_04_25.csv`
-- Figure/table directory: `figures/swd_current_best_2026_04_27`
-- Method promoted for write-up: `deepalign` with `deep_decode=deepalign_transcription_fused`
-- Mean MAE: `367.0 ms`
-- Median absolute error: `165.0 ms`
-- AR@50ms: `41.5%`
-- Pairwise MAE improvement over the recorded `chroma_dtw` baseline: `92.6%`
+- Full-SWD target viability: `results/teacher_target_20ms/teacher_results.csv`
+- Anchor-calibrated teacher route: `18.9 ms` mean MAE, `98.4%` AR@50ms, all
+  24 SWD pairs
+- Best learned unconstrained student gate:
+  `results/initial_plan_supervised_20ms/gate_8_lieder_false_dest_stage2_A4_debug_mae.csv`
+- Best learned student metrics on the 8-lied gate: `112.0 ms` mean MAE,
+  `31.2 ms` median AE, `69.2%` AR@50ms
+- Best AR/p90 trade-off probe:
+  `results/initial_plan_supervised_20ms/gate_8_lieder_false_dest_stage2_min1000_probe.csv`
+  with `113.2 ms` mean MAE, `30.8 ms` median AE, `69.9%` AR@50ms
+- Failure analysis:
+  `results/failure_reports/false_dest_stage2_A4_debug_mae_8_lied_failure_report.csv`
+- Decoder comparison:
+  `results/selector/deepalign_decoder_comparison_fused_r050.csv`
 
-This does not meet the aspirational success thresholds above, but it is the current
-best evidence package and is the result to use unless a later full-SWD run beats it.
+The teacher route meets the original `<20 ms` / `>98%` target, establishing
+that the metric is reachable under dense supervised timing. The learned
+DeepAlign student does not yet meet that target under strict unconstrained
+decoding. Its low median error but much higher mean MAE shows that the remaining
+failure mode is global route excursions in repeated or ambiguous sections, not
+uniformly poor local timing.
+
+The old full-SWD transcription-fused bundle
+(`results/swd_evaluation_transcription_fused_2026_04_25.csv`,
+`367.0 ms` MAE, `41.5%` AR@50ms) is now historical evidence only. It should not
+be promoted over the recovered supervised-route analysis above.
 
 ## Commands
 
@@ -200,6 +218,8 @@ Supported `--deep-decode` values for `deepalign`:
 - `unconstrained`
 - `diagonal_band`
 - `chroma_guided_band`
+- `deepalign_coarse_to_fine`
+- `deepalign_mrmsdtw_guided_refined`
 - `deepalign_transcription_fused`
 - `deepalign_transcription_fused_refined`
 - `deepalign_transcription_guided`
