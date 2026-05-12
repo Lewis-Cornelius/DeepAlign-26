@@ -364,7 +364,9 @@ dis-alignment/
 
 ## Reproducibility Notes
 
-- Datasets, checkpoints, figures, result CSVs, logs, and caches are treated as local artifacts and are not committed.
+- The final dissertation evidence package under `results/final_dissertation_evidence_2026_05_12/`
+  and `figures/final_dissertation_evidence_2026_05_12/` is committed intentionally.
+- Other datasets, experiment checkpoints, ad hoc figures/result CSVs, logs, and caches are treated as local artifacts.
 - The code path is implemented and validated in the Python 3.12 environment with:
   - `.venv312\Scripts\python.exe -m dis_alignment.cli --help`
   - `.venv312\Scripts\python.exe -m pytest -q`
