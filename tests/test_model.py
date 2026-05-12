@@ -644,6 +644,40 @@ class TestSWDPairDatasetSampling:
         assert item["window_duration_b_s"] <= 12.0
         assert item["anchor_event_ids"] == ["2", "3"]
 
+    def test_aligned_sampling_can_emit_distant_hard_negative(self, monkeypatch, tmp_path):
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair = _make_pair(tmp_path, "D911-02")
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.arange(400, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.tile(audio[::10][: max(1, len(audio) // 10)], (2, 1)).astype(np.float32),
+        )
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=1,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+            hard_negative_radius_frames=80,
+            emit_repeated_hard_negatives=True,
+        )
+
+        item = dataset[0]
+
+        assert "spec_neg" in item
+        assert item["spec_neg"].shape[-1] > 0
+        assert item["repeated_negative_start_s"] >= 27.0
+
     def test_fallback_window_includes_end_boundary_anchor(self, monkeypatch, tmp_path):
         from dis_alignment.model.dataset import SWDPairDataset
 

@@ -268,6 +268,10 @@ def train(
         val_samples_per_epoch = len(val_pairs)
 
         train_augmentor = AudioAugmentor(**augmentor_kwargs) if augment else None
+        emit_repeated_hard_negatives = (
+            hard_negative_loss_weight > 0
+            and segment_sampling in {"aligned_measures", "teacher_path", "self_mined_path"}
+        )
         train_dataset = SWDPairDataset(
             swd,
             sr=sr,
@@ -289,6 +293,7 @@ def train(
             teacher_min_confidence=teacher_min_confidence,
             relative_offset_bins=list(resolved_relative_offset_bins),
             hard_negative_radius_frames=hard_negative_radius_frames,
+            emit_repeated_hard_negatives=emit_repeated_hard_negatives,
         )
         val_dataset = SWDPairDataset(
             swd,
@@ -315,6 +320,7 @@ def train(
             teacher_min_confidence=teacher_min_confidence,
             relative_offset_bins=list(resolved_relative_offset_bins),
             hard_negative_radius_frames=hard_negative_radius_frames,
+            emit_repeated_hard_negatives=emit_repeated_hard_negatives,
         )
         n_train = len(train_pairs)
         n_val = len(val_pairs)

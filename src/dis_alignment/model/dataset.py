@@ -99,6 +99,7 @@ class SWDPairDataset(Dataset):
         teacher_min_confidence: float = 0.0,
         relative_offset_bins: list[int] | tuple[int, ...] | None = None,
         hard_negative_radius_frames: int = 96,
+        emit_repeated_hard_negatives: bool = False,
         masked_reconstruction_prob: float = 0.15,
     ):
         if pairs is None:
@@ -125,6 +126,7 @@ class SWDPairDataset(Dataset):
         self.teacher_min_confidence = float(teacher_min_confidence)
         self.relative_offset_bins = tuple(sorted(int(value) for value in (relative_offset_bins or (8, 24, 64, 128))))
         self.hard_negative_radius_frames = max(1, int(hard_negative_radius_frames))
+        self.emit_repeated_hard_negatives = bool(emit_repeated_hard_negatives)
         self.masked_reconstruction_prob = float(np.clip(masked_reconstruction_prob, 0.0, 1.0))
         self._teacher_cache: dict[str, TeacherPath | None] = {}
         self._self_mined_cache: dict[str, TeacherPath | None] = {}
@@ -196,6 +198,8 @@ class SWDPairDataset(Dataset):
         anchor_start_sample: int | None = None
         positive_start_sample: int | None = None
         hard_negative_start_sample: int | None = None
+        repeated_negative_start_s: float | None = None
+        repeated_negative_end_s: float | None = None
         if self.segment_sampling == "aligned_measures":
             window = self._select_aligned_window(pair)
             if window is not None and self._spectrogram_cache is not None:
@@ -219,11 +223,28 @@ class SWDPairDataset(Dataset):
                         hop_length=self.hop_length,
                     )
                 )
+                if self.emit_repeated_hard_negatives:
+                    negative = self._repeated_hard_negative_spec(
+                        log_cqt_b,
+                        avoid_start_s=window.start_b_s,
+                        avoid_end_s=window.end_b_s,
+                    )
+                    if negative is not None:
+                        spec_neg, repeated_negative_start_s, repeated_negative_end_s = negative
             elif window is not None:
                 audio_a, _ = load_swd_audio(pair.piece_a, sr=self.sr)
                 audio_b, _ = load_swd_audio(pair.piece_b, sr=self.sr)
+                full_audio_b = audio_b
                 audio_a = self._crop_audio_window(audio_a, window.start_a_s, window.end_a_s)
                 audio_b = self._crop_audio_window(audio_b, window.start_b_s, window.end_b_s)
+                if self.emit_repeated_hard_negatives:
+                    negative = self._repeated_hard_negative_audio(
+                        full_audio_b,
+                        avoid_start_s=window.start_b_s,
+                        avoid_end_s=window.end_b_s,
+                    )
+                    if negative is not None:
+                        audio_neg, repeated_negative_start_s, repeated_negative_end_s = negative
             else:
                 logger.warning(
                     "Falling back to independent crops for %s because no aligned windows were found.",
@@ -343,6 +364,11 @@ class SWDPairDataset(Dataset):
             "piece_b_id": pair.piece_b.piece_id,
             "segment_sampling": self.segment_sampling,
         }
+        if spec_neg is not None:
+            sample["spec_neg"] = torch.from_numpy(spec_neg).float().unsqueeze(0)
+        if repeated_negative_start_s is not None and repeated_negative_end_s is not None:
+            sample["repeated_negative_start_s"] = float(repeated_negative_start_s)
+            sample["repeated_negative_end_s"] = float(repeated_negative_end_s)
         if window is not None:
             anchor_frames_a, anchor_frames_b = self._anchor_frames_for_window(window, spec_a.shape[1], spec_b.shape[1])
             teacher_frames_a, teacher_frames_b = self._teacher_frames_for_bounds(
@@ -934,6 +960,114 @@ class SWDPairDataset(Dataset):
             return audio[start : start + self.max_samples]
 
         return crop_one(audio_a), crop_one(audio_b)
+
+    def _repeated_hard_negative_spec(
+        self,
+        log_cqt: NDArray[np.floating],
+        *,
+        avoid_start_s: float,
+        avoid_end_s: float,
+    ) -> tuple[NDArray[np.float32], float, float] | None:
+        """Slice a distant crop from the same recording as a repeated-section negative."""
+        n_frames = int(log_cqt.shape[1]) if log_cqt.ndim >= 2 else 0
+        if n_frames <= 0:
+            return None
+        total_duration_s = max(float(n_frames * self.hop_length / self.sr), 1.0 / self.sr)
+        window_duration_s = max(float(avoid_end_s - avoid_start_s), 1.0 / self.sr)
+        start_s = self._sample_repeated_negative_start_s(
+            total_duration_s=total_duration_s,
+            avoid_start_s=avoid_start_s,
+            avoid_end_s=avoid_end_s,
+            window_duration_s=window_duration_s,
+        )
+        if start_s is None:
+            return None
+        end_s = min(total_duration_s, start_s + window_duration_s)
+        spec = standardize_log_cqt(
+            slice_log_cqt(
+                log_cqt,
+                start_s=start_s,
+                end_s=end_s,
+                sr=self.sr,
+                hop_length=self.hop_length,
+            )
+        )
+        return spec.astype(np.float32, copy=False), float(start_s), float(end_s)
+
+    def _repeated_hard_negative_audio(
+        self,
+        audio: NDArray[np.floating],
+        *,
+        avoid_start_s: float,
+        avoid_end_s: float,
+    ) -> tuple[NDArray[np.float32], float, float] | None:
+        """Crop a distant same-recording waveform segment for hard-negative training."""
+        waveform = np.asarray(audio, dtype=np.float32)
+        if waveform.size == 0:
+            return None
+        total_duration_s = max(float(waveform.size / self.sr), 1.0 / self.sr)
+        window_duration_s = max(float(avoid_end_s - avoid_start_s), 1.0 / self.sr)
+        start_s = self._sample_repeated_negative_start_s(
+            total_duration_s=total_duration_s,
+            avoid_start_s=avoid_start_s,
+            avoid_end_s=avoid_end_s,
+            window_duration_s=window_duration_s,
+        )
+        if start_s is None:
+            return None
+        end_s = min(total_duration_s, start_s + window_duration_s)
+        return (
+            self._crop_audio_window(waveform, start_s, end_s).astype(np.float32, copy=False),
+            float(start_s),
+            float(end_s),
+        )
+
+    def _sample_repeated_negative_start_s(
+        self,
+        *,
+        total_duration_s: float,
+        avoid_start_s: float,
+        avoid_end_s: float,
+        window_duration_s: float,
+    ) -> float | None:
+        duration_s = min(max(float(window_duration_s), 1.0 / self.sr), float(total_duration_s))
+        max_start_s = max(0.0, float(total_duration_s) - duration_s)
+        if max_start_s <= 0.0:
+            return None
+
+        avoid_start_s = float(np.clip(avoid_start_s, 0.0, total_duration_s))
+        avoid_end_s = float(np.clip(max(avoid_end_s, avoid_start_s), 0.0, total_duration_s))
+        preferred_gap_s = max(float(self.hard_negative_radius_frames * self.hop_length / self.sr), 0.0)
+
+        for gap_s in (preferred_gap_s, preferred_gap_s * 0.5, 0.0):
+            ranges: list[tuple[float, float]] = []
+            left_end = min(max_start_s, avoid_start_s - gap_s - duration_s)
+            if left_end >= 0.0:
+                ranges.append((0.0, left_end))
+            right_start = max(0.0, avoid_end_s + gap_s)
+            if right_start <= max_start_s:
+                ranges.append((right_start, max_start_s))
+            if not ranges:
+                continue
+
+            if self.deterministic:
+                avoid_center = (avoid_start_s + avoid_end_s) * 0.5
+                candidates = []
+                for start_s, end_s in ranges:
+                    for candidate in (start_s, end_s):
+                        center = candidate + duration_s * 0.5
+                        candidates.append((abs(center - avoid_center), candidate))
+                return float(max(candidates, key=lambda item: item[0])[1])
+
+            widths = np.array([max(end_s - start_s, 1e-6) for start_s, end_s in ranges], dtype=np.float64)
+            probs = widths / widths.sum()
+            choice = int(self._rng.choice(len(ranges), p=probs))
+            start_s, end_s = ranges[choice]
+            if end_s <= start_s:
+                return float(start_s)
+            return float(self._rng.uniform(start_s, end_s))
+
+        return None
 
     def _crop_audio_window(
         self,
