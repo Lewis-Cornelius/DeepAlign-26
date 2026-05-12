@@ -17,6 +17,8 @@ DEEP_DECODE_CHOICES = [
     "unconstrained",
     "diagonal_band",
     "chroma_guided_band",
+    "deepalign_coarse_to_fine",
+    "deepalign_mrmsdtw_guided_refined",
     "deepalign_transcription_fused",
     "deepalign_transcription_fused_refined",
     "deepalign_transcription_guided",
@@ -970,6 +972,7 @@ def train(
 @click.option("--fusion-chroma-weight", type=float, default=0.25, help="Chroma weight for transcription fusion")
 @click.option("--refine-window-sec", type=float, default=8.0, help="Guided transcription refinement window in seconds")
 @click.option("--score-refine-radius-sec", type=float, default=0.5, help="Local score-guided anchor refinement radius")
+@click.option("--coarse-to-fine-radius-sec", type=float, default=0.5, help="Corridor radius for coarse-to-fine DeepAlign decoding")
 @click.option("--performance", "performances", multiple=True, help="Limit to one or more performance ids")
 @click.option("--lied", "lieder", multiple=True, help="Limit to one or more lied ids")
 @click.option("--quiet", is_flag=True, help="Disable the progress bar")
@@ -997,6 +1000,7 @@ def evaluate_swd(
     fusion_chroma_weight: float,
     refine_window_sec: float,
     score_refine_radius_sec: float,
+    coarse_to_fine_radius_sec: float,
     performances: tuple[str, ...],
     lieder: tuple[str, ...],
     quiet: bool,
@@ -1030,6 +1034,7 @@ def evaluate_swd(
             fusion_chroma_weight=fusion_chroma_weight,
             refine_window_sec=refine_window_sec,
             score_refine_radius_sec=score_refine_radius_sec,
+            coarse_to_fine_radius_sec=coarse_to_fine_radius_sec,
             performances=list(performances) or None,
             lieder=list(lieder) or None,
             show_progress=not quiet,

@@ -23,6 +23,8 @@ DEEP_DECODE_MODES = (
     "unconstrained",
     "diagonal_band",
     "chroma_guided_band",
+    "deepalign_coarse_to_fine",
+    "deepalign_mrmsdtw_guided_refined",
     "deepalign_transcription_fused",
     "deepalign_transcription_fused_refined",
     "deepalign_transcription_guided",
@@ -40,6 +42,7 @@ DEEP_VARIANT_COLUMNS = (
     "fusion_chroma_weight",
     "refine_window_sec",
     "score_refine_radius_sec",
+    "coarse_to_fine_radius_sec",
 )
 METHOD_VARIANT_COLUMN = "method_variant"
 MEMORY_EFFICIENT_DTW_MIN_BYTES = 4 * 1024 * 1024 * 1024
@@ -310,6 +313,66 @@ def banded_dtw_align(
     return path, cost, runtime
 
 
+def audio_onset_mrmsdtw_coarse_path(
+    audio_a: np.ndarray,
+    audio_b: np.ndarray,
+    *,
+    sr: int,
+    hop_length: int,
+    memory_limit_mb: int,
+) -> tuple[np.ndarray, float]:
+    """Compute a coarse audio-only route from chroma, DLNCO, and spectral flux."""
+    from dis_alignment.alignment.teacher import _sync_via_audio_onset_mrmsdtw
+
+    start = time.perf_counter()
+    path, _ = _sync_via_audio_onset_mrmsdtw(
+        audio_a=audio_a,
+        audio_b=audio_b,
+        sr=sr,
+        hop_length=hop_length,
+        memory_limit_mb=memory_limit_mb,
+        chroma_weight=1.0,
+        dlnco_weight=1.0,
+        spectral_flux_weight=0.5,
+        estimate_chroma_shift=True,
+        chroma_shift_max_frames=1500,
+    )
+    return path, time.perf_counter() - start
+
+
+def build_audio_guided_deep_features(
+    *,
+    audio: np.ndarray,
+    deep_features: np.ndarray,
+    sr: int,
+    frame_hop: int,
+    fusion_deep_weight: float,
+    fusion_onset_weight: float,
+    fusion_dlnco_weight: float,
+    fusion_chroma_weight: float,
+) -> np.ndarray:
+    """Stack learned DeepAlign features with audio-only chroma/onset cues."""
+    target_frames = int(deep_features.shape[1])
+    blocks: list[np.ndarray] = []
+    if fusion_deep_weight > 0:
+        blocks.append(_normalize_columns(deep_features) * float(fusion_deep_weight))
+    if fusion_chroma_weight > 0 or fusion_dlnco_weight > 0 or fusion_onset_weight > 0:
+        from dis_alignment.alignment.teacher import extract_audio_teacher_features
+
+        audio_features = extract_audio_teacher_features(
+            audio,
+            sr=sr,
+            hop_length=frame_hop,
+            chroma_weight=fusion_chroma_weight,
+            dlnco_weight=fusion_dlnco_weight,
+            spectral_flux_weight=fusion_onset_weight,
+        )
+        blocks.append(_normalize_columns(_match_frame_count(audio_features, target_frames)))
+    if not blocks:
+        raise ValueError("Coarse-to-fine DeepAlign requires at least one positive fine-stage feature weight.")
+    return np.vstack(blocks)
+
+
 def evaluate_pairwise_methods(
     *,
     methods: list[str],
@@ -343,6 +406,7 @@ def evaluate_pairwise_methods(
     fusion_chroma_weight: float = 0.25,
     refine_window_sec: float = 8.0,
     score_refine_radius_sec: float = 0.5,
+    coarse_to_fine_radius_sec: float = 0.5,
     score_path: str | Path | None = None,
     event_ids: list[str] | tuple[str, ...] | np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
@@ -459,6 +523,56 @@ def evaluate_pairwise_methods(
             path_d, _, runtime_d = banded_dtw_align(
                 pooled_a,
                 pooled_b,
+                lower_bounds=lower,
+                upper_bounds=upper,
+                distance=deep_distance,
+            )
+            runtime_d += coarse_runtime
+        elif resolved_deep_decode in {"deepalign_coarse_to_fine", "deepalign_mrmsdtw_guided_refined"}:
+            coarse_path, coarse_runtime = audio_onset_mrmsdtw_coarse_path(
+                audio_a,
+                audio_b,
+                sr=sr,
+                hop_length=chroma_hop,
+                memory_limit_mb=mrmsdtw_memory_limit_mb,
+            )
+            frame_duration_d = (deep_hop * pool_size) / sr
+            resolved_band = (
+                band_radius_frames
+                if band_radius_frames is not None
+                else max(1, int(np.ceil(float(coarse_to_fine_radius_sec) / frame_duration_d)))
+            )
+            lower, upper = _guided_band_bounds(
+                coarse_path=coarse_path,
+                n_query=pooled_a.shape[1],
+                n_reference=pooled_b.shape[1],
+                coarse_frame_duration=chroma_hop / sr,
+                deep_frame_duration=frame_duration_d,
+                band_radius_frames=resolved_band,
+            )
+            fine_a = build_audio_guided_deep_features(
+                audio=audio_a,
+                deep_features=pooled_a,
+                sr=sr,
+                frame_hop=deep_hop * pool_size,
+                fusion_deep_weight=fusion_deep_weight,
+                fusion_onset_weight=fusion_onset_weight,
+                fusion_dlnco_weight=fusion_dlnco_weight,
+                fusion_chroma_weight=fusion_chroma_weight,
+            )
+            fine_b = build_audio_guided_deep_features(
+                audio=audio_b,
+                deep_features=pooled_b,
+                sr=sr,
+                frame_hop=deep_hop * pool_size,
+                fusion_deep_weight=fusion_deep_weight,
+                fusion_onset_weight=fusion_onset_weight,
+                fusion_dlnco_weight=fusion_dlnco_weight,
+                fusion_chroma_weight=fusion_chroma_weight,
+            )
+            path_d, _, runtime_d = banded_dtw_align(
+                fine_a,
+                fine_b,
                 lower_bounds=lower,
                 upper_bounds=upper,
                 distance=deep_distance,
@@ -647,6 +761,7 @@ def evaluate_pairwise_methods(
                     "fusion_chroma_weight": float(fusion_chroma_weight),
                     "refine_window_sec": float(refine_window_sec),
                     "score_refine_radius_sec": float(score_refine_radius_sec),
+                    "coarse_to_fine_radius_sec": float(coarse_to_fine_radius_sec),
                 },
             )
         )
@@ -1429,6 +1544,28 @@ def _diagonal_band_bounds(
     if n_query:
         lower[0] = 0
         upper[-1] = max(n_reference - 1, 0)
+    return _connect_band_bounds(lower, upper)
+
+
+def _connect_band_bounds(lower: np.ndarray, upper: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Expand row-wise bounds just enough that a monotonic DTW path can traverse them."""
+    lower = np.asarray(lower, dtype=np.intp).copy()
+    upper = np.asarray(upper, dtype=np.intp).copy()
+    if lower.size == 0:
+        return lower, upper
+
+    lower[0] = 0
+    upper[0] = max(int(upper[0]), 0)
+    for idx in range(1, lower.size):
+        lower[idx] = min(int(lower[idx]), int(upper[idx - 1]))
+        upper[idx] = max(int(upper[idx]), int(lower[idx]))
+
+    last_reference = int(upper[-1])
+    upper[-1] = last_reference
+    lower[-1] = min(int(lower[-1]), last_reference)
+    for idx in range(lower.size - 2, -1, -1):
+        upper[idx] = max(int(upper[idx]), int(lower[idx + 1]))
+        lower[idx] = min(int(lower[idx]), int(upper[idx]))
     return lower, upper
 
 
@@ -1451,7 +1588,7 @@ def _guided_band_bounds(
     if n_query:
         lower[0] = 0
         upper[-1] = max(n_reference - 1, 0)
-    return lower, upper
+    return _connect_band_bounds(lower, upper)
 
 
 def _dtw_with_bounds(

@@ -57,6 +57,7 @@ def evaluate_pair(
     fusion_chroma_weight: float = 0.25,
     refine_window_sec: float = 8.0,
     score_refine_radius_sec: float = 0.5,
+    coarse_to_fine_radius_sec: float = 0.5,
     matchmaker_cache: dict[tuple[str, str, str], tuple[pd.DataFrame, Any]] | None = None,
     matchmaker_method: str = "arzt",
     matchmaker_feature_type: str = "chroma",
@@ -107,6 +108,7 @@ def evaluate_pair(
         fusion_chroma_weight=fusion_chroma_weight,
         refine_window_sec=refine_window_sec,
         score_refine_radius_sec=score_refine_radius_sec,
+        coarse_to_fine_radius_sec=coarse_to_fine_radius_sec,
         score_path=score_path,
         event_ids=annotations_a["event_id"].astype(str).tolist(),
     )
@@ -209,6 +211,7 @@ def evaluate_swd_dataset(
     fusion_chroma_weight: float = 0.25,
     refine_window_sec: float = 8.0,
     score_refine_radius_sec: float = 0.5,
+    coarse_to_fine_radius_sec: float = 0.5,
     allow_skips: bool = False,
 ) -> pd.DataFrame:
     """Evaluate SWD pairs with the requested methods."""
@@ -250,6 +253,7 @@ def evaluate_swd_dataset(
                 fusion_chroma_weight=fusion_chroma_weight,
                 refine_window_sec=refine_window_sec,
                 score_refine_radius_sec=score_refine_radius_sec,
+                coarse_to_fine_radius_sec=coarse_to_fine_radius_sec,
                 matchmaker_cache=matchmaker_cache,
                 matchmaker_method=matchmaker_method,
                 matchmaker_feature_type=matchmaker_feature_type,

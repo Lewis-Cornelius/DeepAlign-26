@@ -1748,6 +1748,8 @@ class TestTrainingPairSplit:
         [
             "diagonal_band",
             "chroma_guided_band",
+            "deepalign_coarse_to_fine",
+            "deepalign_mrmsdtw_guided_refined",
             "deepalign_transcription_fused",
             "deepalign_score_guided_refined",
         ],

@@ -43,6 +43,8 @@ TRAIN_DEEP_DECODE_CHOICES = (
     "unconstrained",
     "diagonal_band",
     "chroma_guided_band",
+    "deepalign_coarse_to_fine",
+    "deepalign_mrmsdtw_guided_refined",
     "deepalign_transcription_fused",
     "deepalign_transcription_fused_refined",
     "deepalign_transcription_guided",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 from scipy.io import wavfile
 
@@ -214,6 +215,27 @@ def test_banded_dtw_path_is_monotonic():
     assert np.all(np.diff(path[1]) >= 0)
 
 
+def test_guided_band_bounds_are_reachable_when_coarse_path_jumps():
+    coarse_path = np.array([[0, 1, 2, 3], [0, 0, 5, 5]], dtype=np.intp)
+    lower, upper = eval_common._guided_band_bounds(
+        coarse_path=coarse_path,
+        n_query=4,
+        n_reference=6,
+        coarse_frame_duration=1.0,
+        deep_frame_duration=1.0,
+        band_radius_frames=0,
+    )
+    path, _, _ = eval_common.banded_dtw_align(
+        np.eye(6, 4, dtype=np.float32),
+        np.eye(6, dtype=np.float32),
+        lower_bounds=lower,
+        upper_bounds=upper,
+        distance="sqeuclidean",
+    )
+    assert path[0, -1] == 3
+    assert path[1, -1] == 5
+
+
 def test_pairwise_dtw_evaluation_collapses_duplicate_query_frames(monkeypatch):
     """Direct DTW paths can repeat query frames; evaluation should average them safely."""
 
@@ -303,6 +325,67 @@ def test_chroma_guided_band_decode_produces_valid_alignment(monkeypatch, tmp_pat
     assert len(unconstrained) == 1
     assert len(guided) == 1
     assert guided[0]["deep_decode"] == "chroma_guided_band"
+
+
+def test_coarse_to_fine_decode_uses_mrmsdtw_corridor(monkeypatch, tmp_path):
+    pair = _make_swd_pair(tmp_path)
+
+    monkeypatch.setattr(
+        "dis_alignment.evaluation.swd.compute_ground_truth_measure_alignment",
+        lambda _pair: (
+            pd.DataFrame({"event_id": ["1", "2", "3"], "time_s": [0.0, 0.1, 0.2]}),
+            pd.DataFrame({"event_id": ["1", "2", "3"], "time_s": [0.0, 0.1, 0.2]}),
+        ),
+    )
+    monkeypatch.setattr(
+        "dis_alignment.evaluation.swd.load_swd_audio",
+        lambda piece, sr=10: (np.linspace(0.0, 1.0, 30, dtype=np.float32), sr),
+    )
+    monkeypatch.setattr(
+        "dis_alignment.model.inference.extract_deep_features",
+        lambda audio, encoder, sr=10, hop_length=1, device=None, audio_path=None, cache_root=None: np.eye(
+            3, dtype=np.float32
+        ),
+    )
+    monkeypatch.setattr(
+        eval_common,
+        "audio_onset_mrmsdtw_coarse_path",
+        lambda audio_a, audio_b, sr, hop_length, memory_limit_mb: (
+            np.array([[0, 1, 2], [0, 1, 2]], dtype=np.intp),
+            0.01,
+        ),
+    )
+    monkeypatch.setattr(
+        eval_common,
+        "build_audio_guided_deep_features",
+        lambda audio,
+        deep_features,
+        sr,
+        frame_hop,
+        fusion_deep_weight,
+        fusion_onset_weight,
+        fusion_dlnco_weight,
+        fusion_chroma_weight: deep_features,
+    )
+
+    from dis_alignment.evaluation import swd as swd_eval
+
+    rows = swd_eval.evaluate_pair(
+        pair,
+        methods=["deepalign"],
+        encoder=object(),
+        sr=10,
+        chroma_hop=1,
+        deep_hop=1,
+        pool_size=1,
+        deep_decode="deepalign_coarse_to_fine",
+        coarse_to_fine_radius_sec=0.2,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["deep_decode"] == "deepalign_coarse_to_fine"
+    assert rows[0]["coarse_to_fine_radius_sec"] == pytest.approx(0.2)
+    assert rows[0]["mae"] == pytest.approx(0.0)
 
 
 def test_anchor_contrastive_loss_handles_sparse_and_dense_anchors():

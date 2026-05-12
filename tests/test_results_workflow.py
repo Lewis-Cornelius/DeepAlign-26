@@ -228,6 +228,7 @@ def test_parse_methods_defaults_and_validation():
     assert eval_common.parse_deep_decode("deepalign_transcription_fused_refined") == "deepalign_transcription_fused_refined"
     assert eval_common.parse_deep_decode("deepalign_transcription_guided") == "deepalign_transcription_guided"
     assert eval_common.parse_deep_decode("deepalign_score_guided_refined") == "deepalign_score_guided_refined"
+    assert eval_common.parse_deep_decode("deepalign_coarse_to_fine") == "deepalign_coarse_to_fine"
 
 
 def test_transcription_fusion_weights_affect_feature_matrix(monkeypatch, tmp_path):
