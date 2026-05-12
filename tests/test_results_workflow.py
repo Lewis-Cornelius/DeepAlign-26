@@ -1090,3 +1090,120 @@ def test_deepalign_decode_variants_are_not_collapsed(tmp_path):
     )
     assert fused_success["available"]
     assert fused_success["mae_seconds"] == 0.05
+
+
+def test_decoder_comparison_computes_oracle_and_canonical_selector_columns(tmp_path):
+    from scripts.compare_deepalign_decoders import build_decoder_comparison
+
+    base = {
+        "dataset": "swd",
+        "group_id": "D911-02",
+        "piece_a_id": "a",
+        "piece_b_id": "b",
+        "method": "deepalign",
+        "median_ae": 0.03,
+        "ar_100ms": 0.80,
+        "ar_200ms": 0.90,
+        "runtime_s": 1.0,
+        "duration_s": 10.0,
+        "memory_mb": np.nan,
+        "n_gt_points": 10,
+    }
+    unconstrained = pd.DataFrame(
+        [
+            {
+                **base,
+                "pair_id": "p1",
+                "mae": 0.12,
+                "ar_50ms": 0.60,
+                "deep_decode": "unconstrained",
+                "deep_path_cost_per_step": 0.4,
+            },
+            {
+                **base,
+                "pair_id": "p2",
+                "mae": 0.08,
+                "ar_50ms": 0.75,
+                "deep_decode": "unconstrained",
+                "deep_path_cost_per_step": 0.5,
+            },
+        ]
+    )
+    coarse = pd.DataFrame(
+        [
+            {
+                **base,
+                "pair_id": "p1",
+                "mae": 0.05,
+                "ar_50ms": 0.85,
+                "deep_decode": "deepalign_coarse_to_fine",
+                "deep_path_cost_per_step": 0.3,
+                "ctf_band_edge_fraction": 0.02,
+                "ctf_coarse_large_jump_count": 0.0,
+            },
+            {
+                **base,
+                "pair_id": "p2",
+                "mae": 0.11,
+                "ar_50ms": 0.65,
+                "deep_decode": "deepalign_coarse_to_fine",
+                "deep_path_cost_per_step": 0.8,
+                "ctf_band_edge_fraction": 0.20,
+                "ctf_coarse_large_jump_count": 4.0,
+            },
+        ]
+    )
+    unconstrained_path = tmp_path / "u.csv"
+    coarse_path = tmp_path / "c.csv"
+    unconstrained.to_csv(unconstrained_path, index=False)
+    coarse.to_csv(coarse_path, index=False)
+
+    comparison = build_decoder_comparison(
+        unconstrained_csv=unconstrained_path,
+        candidate_csv=coarse_path,
+    )
+
+    assert comparison["oracle_mae_ms"].mean() == pytest.approx(65.0)
+    assert comparison.loc[comparison["pair_id"].eq("p1"), "oracle_choice"].iloc[0] == "coarse_to_fine"
+    assert comparison.loc[comparison["pair_id"].eq("p2"), "oracle_choice"].iloc[0] == "unconstrained"
+    assert comparison.loc[comparison["pair_id"].eq("p1"), "ctf_band_edge_fraction"].iloc[0] == pytest.approx(0.02)
+    assert comparison.loc[comparison["pair_id"].eq("p2"), "unconstrained_cost_per_step"].iloc[0] == pytest.approx(0.5)
+
+
+def test_decoder_selector_uses_confidence_rules_without_metric_leakage():
+    from scripts.evaluate_decoder_selector import apply_selector
+
+    comparison = pd.DataFrame(
+        [
+            {
+                "pair_id": "p1",
+                "group_id": "D911-02",
+                "mae_ms_unconstrained": 120.0,
+                "mae_ms_coarse_to_fine": 50.0,
+                "ar50_pct_unconstrained": 60.0,
+                "ar50_pct_coarse_to_fine": 85.0,
+                "unconstrained_cost_per_step": 0.4,
+                "ctf_cost_per_step": 0.3,
+                "ctf_band_edge_fraction": 0.02,
+                "ctf_coarse_large_jump_count": 0.0,
+            },
+            {
+                "pair_id": "p2",
+                "group_id": "D911-17",
+                "mae_ms_unconstrained": 80.0,
+                "mae_ms_coarse_to_fine": 60.0,
+                "ar50_pct_unconstrained": 75.0,
+                "ar50_pct_coarse_to_fine": 80.0,
+                "unconstrained_cost_per_step": 0.5,
+                "ctf_cost_per_step": 0.7,
+                "ctf_band_edge_fraction": 0.30,
+                "ctf_coarse_large_jump_count": 0.0,
+            },
+        ]
+    )
+
+    selected = apply_selector(comparison)
+
+    assert selected.loc[selected["pair_id"].eq("p1"), "selector_choice"].iloc[0] == "coarse_to_fine"
+    assert selected.loc[selected["pair_id"].eq("p2"), "selector_choice"].iloc[0] == "unconstrained"
+    assert selected.loc[selected["pair_id"].eq("p2"), "selector_mae_ms"].iloc[0] == 80.0

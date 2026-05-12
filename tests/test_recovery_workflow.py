@@ -236,6 +236,23 @@ def test_guided_band_bounds_are_reachable_when_coarse_path_jumps():
     assert path[1, -1] == 5
 
 
+def test_path_and_band_diagnostics_are_label_free():
+    path = np.array([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=np.intp)
+    shape = eval_common.path_shape_diagnostics(path, n_query=4, n_reference=4, prefix="deep")
+    band = eval_common.band_path_diagnostics(
+        path,
+        lower_bounds=np.array([0, 0, 1, 2], dtype=np.intp),
+        upper_bounds=np.array([1, 2, 3, 3], dtype=np.intp),
+        prefix="ctf",
+    )
+
+    assert shape["deep_path_length"] == 4.0
+    assert shape["deep_large_jump_count"] == 0.0
+    assert shape["deep_diagonal_step_fraction"] == pytest.approx(1.0)
+    assert band["ctf_band_width_mean"] == pytest.approx(2.5)
+    assert band["ctf_band_edge_fraction"] == pytest.approx(0.5)
+
+
 def test_pairwise_dtw_evaluation_collapses_duplicate_query_frames(monkeypatch):
     """Direct DTW paths can repeat query frames; evaluation should average them safely."""
 
@@ -385,6 +402,9 @@ def test_coarse_to_fine_decode_uses_mrmsdtw_corridor(monkeypatch, tmp_path):
     assert len(rows) == 1
     assert rows[0]["deep_decode"] == "deepalign_coarse_to_fine"
     assert rows[0]["coarse_to_fine_radius_sec"] == pytest.approx(0.2)
+    assert rows[0]["deep_path_cost_per_step"] >= 0.0
+    assert rows[0]["ctf_band_edge_fraction"] >= 0.0
+    assert rows[0]["ctf_coarse_large_jump_count"] == 0.0
     assert rows[0]["mae"] == pytest.approx(0.0)
 
 

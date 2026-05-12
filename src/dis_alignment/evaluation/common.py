@@ -373,6 +373,98 @@ def build_audio_guided_deep_features(
     return np.vstack(blocks)
 
 
+def path_shape_diagnostics(
+    path: np.ndarray,
+    *,
+    n_query: int,
+    n_reference: int,
+    prefix: str,
+) -> dict[str, float]:
+    """Return non-label path-shape diagnostics for route confidence checks."""
+    values = np.asarray(path, dtype=np.intp)
+    if values.ndim != 2 or values.shape[0] != 2:
+        raise ValueError("DTW path must have shape (2, n_steps).")
+
+    path_length = int(values.shape[1])
+    expected_length = max(int(n_query) + int(n_reference) - 1, 1)
+    diagnostics: dict[str, float] = {
+        f"{prefix}_path_length": float(path_length),
+        f"{prefix}_path_length_ratio": float(path_length / expected_length),
+        f"{prefix}_large_jump_count": 0.0,
+        f"{prefix}_horizontal_vertical_ratio": float("nan"),
+        f"{prefix}_diagonal_step_fraction": float("nan"),
+        f"{prefix}_slope_mean": float("nan"),
+        f"{prefix}_slope_std": float("nan"),
+        f"{prefix}_endpoint_strain_frames": float("nan"),
+    }
+    if path_length == 0:
+        return diagnostics
+
+    endpoint_strain = (
+        abs(int(values[0, 0]))
+        + abs(int(values[1, 0]))
+        + abs(max(int(n_query) - 1, 0) - int(values[0, -1]))
+        + abs(max(int(n_reference) - 1, 0) - int(values[1, -1]))
+    )
+    diagnostics[f"{prefix}_endpoint_strain_frames"] = float(endpoint_strain)
+
+    if path_length < 2:
+        return diagnostics
+
+    d_query = np.diff(values[0]).astype(np.float64)
+    d_ref = np.diff(values[1]).astype(np.float64)
+    horizontal = float(np.sum((d_query == 0) & (d_ref > 0)))
+    vertical = float(np.sum((d_ref == 0) & (d_query > 0)))
+    diagonal = float(np.sum((d_query > 0) & (d_ref > 0)))
+    steps = max(float(d_query.size), 1.0)
+    diagnostics[f"{prefix}_large_jump_count"] = float(np.sum((np.abs(d_query) > 1) | (np.abs(d_ref) > 1)))
+    diagnostics[f"{prefix}_horizontal_vertical_ratio"] = horizontal / max(vertical, 1.0)
+    diagnostics[f"{prefix}_diagonal_step_fraction"] = diagonal / steps
+    slope_mask = d_query > 0
+    if np.any(slope_mask):
+        slopes = d_ref[slope_mask] / np.maximum(d_query[slope_mask], 1e-12)
+        diagnostics[f"{prefix}_slope_mean"] = float(np.mean(slopes))
+        diagnostics[f"{prefix}_slope_std"] = float(np.std(slopes))
+    return diagnostics
+
+
+def band_path_diagnostics(
+    path: np.ndarray,
+    *,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
+    prefix: str,
+) -> dict[str, float]:
+    """Return non-label diagnostics describing how a path used its DTW corridor."""
+    values = np.asarray(path, dtype=np.intp)
+    lower = np.asarray(lower_bounds, dtype=np.intp)
+    upper = np.asarray(upper_bounds, dtype=np.intp)
+    if values.ndim != 2 or values.shape[0] != 2:
+        raise ValueError("DTW path must have shape (2, n_steps).")
+    if lower.shape != upper.shape:
+        raise ValueError("Band lower and upper bounds must have the same shape.")
+    if values.shape[1] == 0 or lower.size == 0:
+        return {
+            f"{prefix}_band_width_mean": float("nan"),
+            f"{prefix}_band_edge_fraction": float("nan"),
+            f"{prefix}_band_lower_edge_fraction": float("nan"),
+            f"{prefix}_band_upper_edge_fraction": float("nan"),
+        }
+
+    rows = np.clip(values[0], 0, lower.size - 1)
+    cols = values[1]
+    lower_at_path = lower[rows]
+    upper_at_path = upper[rows]
+    on_lower = cols <= lower_at_path
+    on_upper = cols >= upper_at_path
+    return {
+        f"{prefix}_band_width_mean": float(np.mean(upper - lower + 1)),
+        f"{prefix}_band_edge_fraction": float(np.mean(on_lower | on_upper)),
+        f"{prefix}_band_lower_edge_fraction": float(np.mean(on_lower)),
+        f"{prefix}_band_upper_edge_fraction": float(np.mean(on_upper)),
+    }
+
+
 def evaluate_pairwise_methods(
     *,
     methods: list[str],
@@ -494,23 +586,32 @@ def evaluate_pairwise_methods(
         pooled_a = temporal_pool(feat_a, pool_size=pool_size)
         pooled_b = temporal_pool(feat_b, pool_size=pool_size)
         refinement_features: tuple[np.ndarray, np.ndarray] | None = None
+        deep_diagnostics: dict[str, float] = {}
         if resolved_deep_decode == "unconstrained":
-            path_d, _, runtime_d = fast_dtw_align(pooled_a, pooled_b, distance=deep_distance)
+            path_d, path_cost_d, runtime_d = fast_dtw_align(pooled_a, pooled_b, distance=deep_distance)
         elif resolved_deep_decode == "diagonal_band":
             resolved_band = band_radius_frames if band_radius_frames is not None else 150
             lower, upper = _diagonal_band_bounds(pooled_a.shape[1], pooled_b.shape[1], resolved_band)
-            path_d, _, runtime_d = banded_dtw_align(
+            path_d, path_cost_d, runtime_d = banded_dtw_align(
                 pooled_a,
                 pooled_b,
                 lower_bounds=lower,
                 upper_bounds=upper,
                 distance=deep_distance,
             )
+            deep_diagnostics.update(
+                band_path_diagnostics(
+                    path_d,
+                    lower_bounds=lower,
+                    upper_bounds=upper,
+                    prefix="deep",
+                )
+            )
         elif resolved_deep_decode == "chroma_guided_band":
             if chroma_a is None or chroma_b is None:
                 chroma_a = extract_chroma_cqt(audio_a, sr=sr, hop_length=chroma_hop)
                 chroma_b = extract_chroma_cqt(audio_b, sr=sr, hop_length=chroma_hop)
-            coarse_path, _, coarse_runtime = fast_dtw_align(chroma_a, chroma_b, distance="cosine")
+            coarse_path, coarse_cost, coarse_runtime = fast_dtw_align(chroma_a, chroma_b, distance="cosine")
             resolved_band = band_radius_frames if band_radius_frames is not None else 150
             lower, upper = _guided_band_bounds(
                 coarse_path=coarse_path,
@@ -520,7 +621,7 @@ def evaluate_pairwise_methods(
                 deep_frame_duration=(deep_hop * pool_size) / sr,
                 band_radius_frames=resolved_band,
             )
-            path_d, _, runtime_d = banded_dtw_align(
+            path_d, path_cost_d, runtime_d = banded_dtw_align(
                 pooled_a,
                 pooled_b,
                 lower_bounds=lower,
@@ -528,6 +629,29 @@ def evaluate_pairwise_methods(
                 distance=deep_distance,
             )
             runtime_d += coarse_runtime
+            deep_diagnostics.update(
+                {
+                    "deep_coarse_path_cost": float(coarse_cost),
+                    "deep_coarse_path_cost_per_step": float(coarse_cost / max(coarse_path.shape[1], 1)),
+                    "deep_band_radius_frames_resolved": float(resolved_band),
+                }
+            )
+            deep_diagnostics.update(
+                path_shape_diagnostics(
+                    coarse_path,
+                    n_query=chroma_a.shape[1],
+                    n_reference=chroma_b.shape[1],
+                    prefix="deep_coarse",
+                )
+            )
+            deep_diagnostics.update(
+                band_path_diagnostics(
+                    path_d,
+                    lower_bounds=lower,
+                    upper_bounds=upper,
+                    prefix="deep",
+                )
+            )
         elif resolved_deep_decode in {"deepalign_coarse_to_fine", "deepalign_mrmsdtw_guided_refined"}:
             coarse_path, coarse_runtime = audio_onset_mrmsdtw_coarse_path(
                 audio_a,
@@ -570,7 +694,7 @@ def evaluate_pairwise_methods(
                 fusion_dlnco_weight=fusion_dlnco_weight,
                 fusion_chroma_weight=fusion_chroma_weight,
             )
-            path_d, _, runtime_d = banded_dtw_align(
+            path_d, path_cost_d, runtime_d = banded_dtw_align(
                 fine_a,
                 fine_b,
                 lower_bounds=lower,
@@ -578,6 +702,28 @@ def evaluate_pairwise_methods(
                 distance=deep_distance,
             )
             runtime_d += coarse_runtime
+            deep_diagnostics.update(
+                {
+                    "ctf_band_radius_frames_resolved": float(resolved_band),
+                    "ctf_coarse_runtime_s": float(coarse_runtime),
+                }
+            )
+            deep_diagnostics.update(
+                path_shape_diagnostics(
+                    coarse_path,
+                    n_query=max(int(coarse_path[0].max()) + 1, 1) if coarse_path.size else 0,
+                    n_reference=max(int(coarse_path[1].max()) + 1, 1) if coarse_path.size else 0,
+                    prefix="ctf_coarse",
+                )
+            )
+            deep_diagnostics.update(
+                band_path_diagnostics(
+                    path_d,
+                    lower_bounds=lower,
+                    upper_bounds=upper,
+                    prefix="ctf",
+                )
+            )
         elif resolved_deep_decode in {"deepalign_transcription_fused", "deepalign_transcription_fused_refined"}:
             fused_a = _build_transcription_fused_features(
                 audio=audio_a,
@@ -606,7 +752,7 @@ def evaluate_pairwise_methods(
                 fusion_chroma_weight=fusion_chroma_weight,
             )
             refinement_features = (fused_a, fused_b)
-            path_d, _, runtime_d = fast_dtw_align(fused_a, fused_b, distance=deep_distance)
+            path_d, path_cost_d, runtime_d = fast_dtw_align(fused_a, fused_b, distance=deep_distance)
         elif resolved_deep_decode == "deepalign_transcription_guided":
             fused_a = _build_transcription_fused_features(
                 audio=audio_a,
@@ -666,7 +812,7 @@ def evaluate_pairwise_methods(
                 band_radius_frames=resolved_band,
             )
             try:
-                path_d, _, runtime_d = banded_dtw_align(
+                path_d, path_cost_d, runtime_d = banded_dtw_align(
                     fused_a,
                     fused_b,
                     lower_bounds=lower,
@@ -674,11 +820,26 @@ def evaluate_pairwise_methods(
                     distance=deep_distance,
                 )
                 runtime_d += coarse_runtime
+                deep_diagnostics.update(
+                    {
+                        "deep_band_radius_frames_resolved": float(resolved_band),
+                    }
+                )
+                deep_diagnostics.update(
+                    band_path_diagnostics(
+                        path_d,
+                        lower_bounds=lower,
+                        upper_bounds=upper,
+                        prefix="deep",
+                    )
+                )
             except ValueError:
-                path_d, _, runtime_d = fast_dtw_align(fused_a, fused_b, distance=deep_distance)
+                path_d, path_cost_d, runtime_d = fast_dtw_align(fused_a, fused_b, distance=deep_distance)
                 runtime_d += coarse_runtime
         else:
             frame_duration_d = (deep_hop * pool_size) / sr
+            path_d = np.empty((2, 0), dtype=np.intp)
+            path_cost_d = float("nan")
             pred_b_d, runtime_d = _predict_score_guided_pairwise_anchors(
                 audio_a=audio_a,
                 audio_b=audio_b,
@@ -722,6 +883,20 @@ def evaluate_pairwise_methods(
         if resolved_deep_decode != "deepalign_score_guided_refined":
             frame_duration_d = (deep_hop * pool_size) / sr
             pred_b_d = _interp_monotonic(gt_a, path_d[0] * frame_duration_d, path_d[1] * frame_duration_d)
+            deep_diagnostics.update(
+                {
+                    "deep_path_cost": float(path_cost_d),
+                    "deep_path_cost_per_step": float(path_cost_d / max(path_d.shape[1], 1)),
+                }
+            )
+            deep_diagnostics.update(
+                path_shape_diagnostics(
+                    path_d,
+                    n_query=pooled_a.shape[1],
+                    n_reference=pooled_b.shape[1],
+                    prefix="deep",
+                )
+            )
             if resolved_deep_decode == "deepalign_transcription_fused_refined":
                 if refinement_features is None:
                     raise ValueError("Local refinement requires fused transcription features.")
@@ -762,6 +937,7 @@ def evaluate_pairwise_methods(
                     "refine_window_sec": float(refine_window_sec),
                     "score_refine_radius_sec": float(score_refine_radius_sec),
                     "coarse_to_fine_radius_sec": float(coarse_to_fine_radius_sec),
+                    **deep_diagnostics,
                 },
             )
         )
