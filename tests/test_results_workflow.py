@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,76 @@ from dis_alignment.data.swd import SWDPair, SWDPiece
 from dis_alignment.evaluation import common as eval_common
 from dis_alignment.evaluation import mazurka as mazurka_eval
 from dis_alignment.evaluation import swd as swd_eval
+
+
+def _load_failure_report_script():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "report_deepalign_failures.py"
+    spec = importlib.util.spec_from_file_location("report_deepalign_failures", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_failure_report_summarizes_worst_event(tmp_path):
+    module = _load_failure_report_script()
+    pair = SWDPair(
+        pair_id="D911-01_HU33_SC06",
+        lied_id="D911-01",
+        piece_a=SWDPiece("D911-01_HU33", "D911-01", "HU33", tmp_path / "a.wav"),
+        piece_b=SWDPiece("D911-01_SC06", "D911-01", "SC06", tmp_path / "b.wav"),
+    )
+
+    summary = module.summarize_pair_errors(
+        pair=pair,
+        event_ids=["m1", "m2", "m3"],
+        gt_a_s=np.array([0.0, 1.0, 2.0]),
+        gt_b_s=np.array([0.0, 1.0, 2.0]),
+        pred_b_s=np.array([0.0, 1.26, 1.96]),
+        checkpoint="checkpoint.pt",
+        sr=10,
+        deep_hop=1,
+        pool_size=1,
+        deep_distance="sqeuclidean",
+        deep_decode="unconstrained",
+        path_cost=3.5,
+        runtime_s=0.2,
+        path_length=9,
+    )
+
+    assert summary["pair_id"] == "D911-01_HU33_SC06"
+    assert summary["mae_ms"] == pytest.approx((0.0 + 260.0 + 40.0) / 3.0)
+    assert summary["max_error_ms"] == pytest.approx(260.0)
+    assert summary["worst_event_id"] == "m2"
+    assert summary["worst_error_sign"] == "late"
+    assert summary["ar50_pct"] == pytest.approx(2.0 / 3.0 * 100.0)
+
+
+def test_failure_report_event_rows_mark_thresholds(tmp_path):
+    module = _load_failure_report_script()
+    pair = SWDPair(
+        pair_id="D911-02_HU33_SC06",
+        lied_id="D911-02",
+        piece_a=SWDPiece("D911-02_HU33", "D911-02", "HU33", tmp_path / "a.wav"),
+        piece_b=SWDPiece("D911-02_SC06", "D911-02", "SC06", tmp_path / "b.wav"),
+    )
+
+    rows = module.event_error_rows(
+        pair=pair,
+        event_ids=["m1", "m2"],
+        gt_a_s=np.array([0.0, 1.0]),
+        gt_b_s=np.array([0.0, 1.0]),
+        pred_b_s=np.array([0.12, 0.97]),
+        deep_hop=1,
+        pool_size=1,
+    )
+
+    assert rows[0]["event_id"] == "m1"
+    assert rows[0]["error_sign"] == "late"
+    assert rows[0]["off_100ms"] is True
+    assert rows[1]["error_sign"] == "early"
+    assert rows[1]["off_50ms"] is False
 
 
 def test_parse_methods_defaults_and_validation():
