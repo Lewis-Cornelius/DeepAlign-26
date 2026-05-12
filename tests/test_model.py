@@ -425,6 +425,20 @@ class TestStrictAudioOnlyLosses:
 
         assert loss.item() == pytest.approx(0.0)
 
+    def test_hard_negative_loss_masks_invalid_rows(self):
+        from dis_alignment.model.anchor_loss import HardNegativeContrastiveLoss
+
+        loss_fn = HardNegativeContrastiveLoss(margin=0.2)
+        emb_a = torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]]])
+        emb_b = emb_a.clone()
+        emb_neg = torch.tensor([[[0.0, 1.0]], [[1.0, 0.0]]])
+
+        masked = loss_fn(emb_a, emb_b, emb_neg, valid_mask=torch.tensor([True, False]))
+        unmasked = loss_fn(emb_a, emb_b, emb_neg)
+
+        assert masked.item() == pytest.approx(0.0)
+        assert unmasked.item() > masked.item()
+
     def test_masked_reconstruction_ignores_unmasked_frames(self):
         from dis_alignment.model.anchor_loss import MaskedReconstructionLoss
 
@@ -607,14 +621,21 @@ class TestCollateVariableLength:
                 "reconstruction_mask_a": torch.ones(1, 2, 7),
                 "pair_id": "b",
             },
+            {
+                "spec_a": torch.randn(1, 2, 9),
+                "spec_b": torch.randn(1, 2, 4),
+                "reconstruction_target_a": torch.randn(1, 2, 9),
+                "reconstruction_mask_a": torch.ones(1, 2, 9),
+                "pair_id": "c",
+            },
         ]
 
         collated = collate_variable_length(batch)
 
-        assert collated["spec_neg"].shape == (2, 1, 2, 6)
-        assert collated["lengths_neg"].tolist() == [3, 6]
-        assert collated["reconstruction_target_a"].shape == (2, 1, 2, 7)
-        assert collated["reconstruction_mask_a"].shape == (2, 1, 2, 7)
+        assert collated["spec_neg"].shape == (3, 1, 2, 9)
+        assert collated["lengths_neg"].tolist() == [3, 6, 9]
+        assert collated["reconstruction_target_a"].shape == (3, 1, 2, 9)
+        assert collated["reconstruction_mask_a"].shape == (3, 1, 2, 9)
 
 
 class TestSWDPairDatasetSampling:
@@ -677,6 +698,47 @@ class TestSWDPairDatasetSampling:
         assert "spec_neg" in item
         assert item["spec_neg"].shape[-1] > 0
         assert item["repeated_negative_start_s"] >= 27.0
+
+    def test_aligned_sampling_can_emit_false_destination_negative(self, monkeypatch, tmp_path):
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair = _make_pair(tmp_path, "D911-03")
+        false_destinations = tmp_path / "false_destinations.csv"
+        false_destinations.write_text(
+            "pair_id,event_id,gt_a_s,gt_b_s,pred_b_s,abs_error_ms,error_sign\n"
+            f"{pair.pair_id},2,9.0,10.0,25.0,1500.0,late\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.arange(400, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.tile(audio[::10][: max(1, len(audio) // 10)], (2, 1)).astype(np.float32),
+        )
+
+        dataset = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=1,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+            false_destination_negative_root=false_destinations,
+            false_destination_min_error_ms=500.0,
+        )
+
+        item = dataset[0]
+
+        assert item["negative_source"] == "false_destination"
+        assert item["negative_valid"] is True
+        assert item["false_destination_event_id"] == "2"
+        assert item["repeated_negative_start_s"] == pytest.approx(24.0)
 
     def test_fallback_window_includes_end_boundary_anchor(self, monkeypatch, tmp_path):
         from dis_alignment.model.dataset import SWDPairDataset
@@ -1488,6 +1550,9 @@ class TestTrainingPairSplit:
             "  masked_reconstruction_loss_weight: 0.1\n"
             "  hard_negative_loss_weight: 0.3\n"
             "  hard_negative_radius_frames: 32\n"
+            "  false_destination_negative_loss_weight: 0.07\n"
+            "  false_destination_negative_root: results/failure_reports/mined.csv\n"
+            "  false_destination_min_error_ms: 750\n"
             "  memory_bank_size: 128\n"
             "soft_dtw:\n"
             "  loss_weight: 0.0\n",
@@ -1539,6 +1604,9 @@ class TestTrainingPairSplit:
             cycle_smoothness_loss_weight=None,
             hard_negative_loss_weight=None,
             hard_negative_radius_frames=None,
+            false_destination_negative_loss_weight=None,
+            false_destination_negative_root=None,
+            false_destination_min_error_ms=None,
             memory_bank_size=None,
             teacher_path_root=None,
             self_mined_path_root=None,
@@ -1568,6 +1636,9 @@ class TestTrainingPairSplit:
         assert kwargs["masked_reconstruction_loss_weight"] == pytest.approx(0.1)
         assert kwargs["hard_negative_loss_weight"] == pytest.approx(0.3)
         assert kwargs["hard_negative_radius_frames"] == 32
+        assert kwargs["false_destination_negative_loss_weight"] == pytest.approx(0.07)
+        assert kwargs["false_destination_negative_root"] == "results/failure_reports/mined.csv"
+        assert kwargs["false_destination_min_error_ms"] == pytest.approx(750.0)
         assert kwargs["memory_bank_size"] == 128
 
     def test_headline_claim_config_accepts_strict_audio_only_route(self):

@@ -27,6 +27,16 @@ def _load_failure_report_script():
     return module
 
 
+def _load_false_destination_miner_script():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "mine_false_destinations.py"
+    spec = importlib.util.spec_from_file_location("mine_false_destinations", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_failure_report_summarizes_worst_event(tmp_path):
     module = _load_failure_report_script()
     pair = SWDPair(
@@ -76,6 +86,7 @@ def test_failure_report_event_rows_mark_thresholds(tmp_path):
         gt_a_s=np.array([0.0, 1.0]),
         gt_b_s=np.array([0.0, 1.0]),
         pred_b_s=np.array([0.12, 0.97]),
+        sr=10,
         deep_hop=1,
         pool_size=1,
     )
@@ -85,6 +96,59 @@ def test_failure_report_event_rows_mark_thresholds(tmp_path):
     assert rows[0]["off_100ms"] is True
     assert rows[1]["error_sign"] == "early"
     assert rows[1]["off_50ms"] is False
+    assert rows[0]["pred_b_frame"] == 1
+
+
+def test_false_destination_miner_filters_and_suppresses_nearby_events():
+    module = _load_false_destination_miner_script()
+    event_errors = pd.DataFrame(
+        [
+            {
+                "pair_id": "p1",
+                "group_id": "g",
+                "piece_b_id": "b",
+                "event_id": "a",
+                "gt_a_s": 1.0,
+                "gt_b_s": 1.0,
+                "pred_b_s": 10.0,
+                "abs_error_ms": 1200.0,
+                "error_sign": "late",
+                "gt_b_frame": 100,
+                "pred_b_frame": 1000,
+            },
+            {
+                "pair_id": "p1",
+                "group_id": "g",
+                "piece_b_id": "b",
+                "event_id": "b",
+                "gt_a_s": 2.0,
+                "gt_b_s": 2.0,
+                "pred_b_s": 10.8,
+                "abs_error_ms": 900.0,
+                "error_sign": "late",
+                "gt_b_frame": 200,
+                "pred_b_frame": 1080,
+            },
+            {
+                "pair_id": "p1",
+                "group_id": "g",
+                "piece_b_id": "b",
+                "event_id": "c",
+                "gt_a_s": 3.0,
+                "gt_b_s": 3.0,
+                "pred_b_s": 30.0,
+                "abs_error_ms": 400.0,
+                "error_sign": "late",
+                "gt_b_frame": 300,
+                "pred_b_frame": 3000,
+            },
+        ]
+    )
+
+    mined = module.mine_false_destinations(event_errors, min_error_ms=500.0, nms_window_sec=2.0)
+
+    assert mined["event_id"].tolist() == ["a"]
+    assert mined["abs_error_ms"].tolist() == [1200.0]
 
 
 def test_parse_methods_defaults_and_validation():

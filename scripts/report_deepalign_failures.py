@@ -91,12 +91,13 @@ def event_error_rows(
     gt_a_s: np.ndarray,
     gt_b_s: np.ndarray,
     pred_b_s: np.ndarray,
+    sr: int = 22050,
     deep_hop: int,
     pool_size: int,
 ) -> list[dict[str, Any]]:
     signed_errors_s = np.asarray(pred_b_s, dtype=np.float64) - np.asarray(gt_b_s, dtype=np.float64)
     abs_errors_s = np.abs(signed_errors_s)
-    frame_duration_s = (deep_hop * pool_size) / 22050.0
+    frame_duration_s = (deep_hop * pool_size) / float(sr)
     rows: list[dict[str, Any]] = []
     for idx, abs_error_s in enumerate(abs_errors_s):
         signed_error_s = float(signed_errors_s[idx])
@@ -194,6 +195,7 @@ def report_pair_failures(
         gt_a_s=gt_a_s,
         gt_b_s=gt_b_s,
         pred_b_s=pred_b_s,
+        sr=sr,
         deep_hop=deep_hop,
         pool_size=pool_size,
     )

@@ -417,6 +417,7 @@ class HardNegativeContrastiveLoss(nn.Module):
         lengths_a: Tensor | Sequence[int] | None = None,
         lengths_b: Tensor | Sequence[int] | None = None,
         lengths_neg: Tensor | Sequence[int] | None = None,
+        valid_mask: Tensor | Sequence[bool] | None = None,
     ) -> Tensor:
         pooled_a = SequenceContrastiveLoss._masked_mean_pool(emb_a, lengths_a)
         pooled_b = SequenceContrastiveLoss._masked_mean_pool(emb_b, lengths_b)
@@ -430,7 +431,17 @@ class HardNegativeContrastiveLoss(nn.Module):
         negative_b = (pooled_b * pooled_neg).sum(dim=-1)
         loss_a = torch.relu(self.margin + negative_a - positive)
         loss_b = torch.relu(self.margin + negative_b - positive)
-        return torch.stack([loss_a, loss_b], dim=0).mean()
+        per_item = torch.stack([loss_a, loss_b], dim=0).mean(dim=0)
+        if valid_mask is not None:
+            mask = torch.as_tensor(valid_mask, device=per_item.device, dtype=torch.bool)
+            if mask.numel() >= per_item.numel():
+                mask = mask[: per_item.numel()]
+            else:
+                mask = torch.nn.functional.pad(mask, (0, per_item.numel() - mask.numel()))
+            if not mask.any():
+                return per_item.new_zeros(())
+            per_item = per_item[mask]
+        return per_item.mean()
 
 
 class MaskedReconstructionLoss(nn.Module):

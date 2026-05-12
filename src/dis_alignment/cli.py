@@ -693,6 +693,9 @@ def _row_costs(query, candidates, *, distance: str):
 @click.option("--cycle-smoothness-loss-weight", type=float, default=None, help="Stage 2 expected-path smoothness weight")
 @click.option("--hard-negative-loss-weight", type=float, default=None, help="Stage 1 v2 nearby same-recording hard-negative weight")
 @click.option("--hard-negative-radius-frames", type=int, default=None, help="Maximum radius for strict same-audio hard negatives")
+@click.option("--false-destination-negative-loss-weight", type=float, default=None, help="Mined false-destination negative loss weight")
+@click.option("--false-destination-negative-root", type=click.Path(), default=None, help="CSV of mined model false destinations")
+@click.option("--false-destination-min-error-ms", type=float, default=None, help="Minimum mined false-destination error")
 @click.option("--memory-bank-size", type=int, default=None, help="Reserved strict SSL memory-bank size")
 @click.option("--teacher-path-root", type=click.Path(), default=None, help="Directory containing teacher path NPZ files")
 @click.option("--self-mined-path-root", type=click.Path(), default=None, help="Directory containing model self-mined path NPZ files")
@@ -757,6 +760,9 @@ def train(
     cycle_smoothness_loss_weight: float | None,
     hard_negative_loss_weight: float | None,
     hard_negative_radius_frames: int | None,
+    false_destination_negative_loss_weight: float | None,
+    false_destination_negative_root: str | None,
+    false_destination_min_error_ms: float | None,
     memory_bank_size: int | None,
     teacher_path_root: str | None,
     self_mined_path_root: str | None,
@@ -884,6 +890,21 @@ def train(
         ),
         hard_negative_loss_weight=_coalesce(hard_negative_loss_weight, training_cfg.get("hard_negative_loss_weight"), 0.0),
         hard_negative_radius_frames=_coalesce(hard_negative_radius_frames, training_cfg.get("hard_negative_radius_frames"), 96),
+        false_destination_negative_loss_weight=_coalesce(
+            false_destination_negative_loss_weight,
+            training_cfg.get("false_destination_negative_loss_weight"),
+            0.0,
+        ),
+        false_destination_negative_root=_coalesce(
+            false_destination_negative_root,
+            training_cfg.get("false_destination_negative_root"),
+            None,
+        ),
+        false_destination_min_error_ms=_coalesce(
+            false_destination_min_error_ms,
+            training_cfg.get("false_destination_min_error_ms"),
+            500.0,
+        ),
         memory_bank_size=_coalesce(memory_bank_size, training_cfg.get("memory_bank_size"), 0),
         teacher_path_root=_coalesce(teacher_path_root, training_cfg.get("teacher_path_root"), None),
         self_mined_path_root=_coalesce(self_mined_path_root, training_cfg.get("self_mined_path_root"), None),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,19 @@ class TeacherPathWindow:
     center_b_s: float
 
 
+@dataclass(frozen=True)
+class FalseDestinationNegative:
+    """One mined model false destination for targeted hard-negative sampling."""
+
+    pair_id: str
+    event_id: str
+    gt_a_s: float
+    gt_b_s: float
+    pred_b_s: float
+    abs_error_ms: float
+    error_sign: str
+
+
 class SWDPairDataset(Dataset):
     """
     PyTorch dataset for pairs of SWD recordings.
@@ -95,6 +109,8 @@ class SWDPairDataset(Dataset):
         cache_root: str | Path | None = None,
         teacher_path_root: str | Path | None = None,
         self_mined_path_root: str | Path | None = None,
+        false_destination_negative_root: str | Path | None = None,
+        false_destination_min_error_ms: float = 500.0,
         num_teacher_samples: int = 64,
         teacher_min_confidence: float = 0.0,
         relative_offset_bins: list[int] | tuple[int, ...] | None = None,
@@ -122,6 +138,10 @@ class SWDPairDataset(Dataset):
         self.cache_root = Path(cache_root) if cache_root is not None else None
         self.teacher_path_root = Path(teacher_path_root) if teacher_path_root is not None else None
         self.self_mined_path_root = Path(self_mined_path_root) if self_mined_path_root is not None else None
+        self.false_destination_negative_root = (
+            Path(false_destination_negative_root) if false_destination_negative_root is not None else None
+        )
+        self.false_destination_min_error_ms = float(false_destination_min_error_ms)
         self.num_teacher_samples = max(0, int(num_teacher_samples))
         self.teacher_min_confidence = float(teacher_min_confidence)
         self.relative_offset_bins = tuple(sorted(int(value) for value in (relative_offset_bins or (8, 24, 64, 128))))
@@ -130,6 +150,7 @@ class SWDPairDataset(Dataset):
         self.masked_reconstruction_prob = float(np.clip(masked_reconstruction_prob, 0.0, 1.0))
         self._teacher_cache: dict[str, TeacherPath | None] = {}
         self._self_mined_cache: dict[str, TeacherPath | None] = {}
+        self._false_destination_negatives = self._load_false_destination_negatives()
 
         if self.segment_sampling not in SEGMENT_SAMPLING_MODES:
             raise ValueError(
@@ -223,7 +244,10 @@ class SWDPairDataset(Dataset):
                         hop_length=self.hop_length,
                     )
                 )
-                if self.emit_repeated_hard_negatives:
+                false_negative = self._false_destination_negative_spec(log_cqt_b, pair, window)
+                if false_negative is not None:
+                    spec_neg, repeated_negative_start_s, repeated_negative_end_s, false_row = false_negative
+                elif self.emit_repeated_hard_negatives:
                     negative = self._repeated_hard_negative_spec(
                         log_cqt_b,
                         avoid_start_s=window.start_b_s,
@@ -237,7 +261,10 @@ class SWDPairDataset(Dataset):
                 full_audio_b = audio_b
                 audio_a = self._crop_audio_window(audio_a, window.start_a_s, window.end_a_s)
                 audio_b = self._crop_audio_window(audio_b, window.start_b_s, window.end_b_s)
-                if self.emit_repeated_hard_negatives:
+                false_negative = self._false_destination_negative_audio(full_audio_b, pair, window)
+                if false_negative is not None:
+                    audio_neg, repeated_negative_start_s, repeated_negative_end_s, false_row = false_negative
+                elif self.emit_repeated_hard_negatives:
                     negative = self._repeated_hard_negative_audio(
                         full_audio_b,
                         avoid_start_s=window.start_b_s,
@@ -366,9 +393,20 @@ class SWDPairDataset(Dataset):
         }
         if spec_neg is not None:
             sample["spec_neg"] = torch.from_numpy(spec_neg).float().unsqueeze(0)
+            sample["negative_valid"] = True
+        else:
+            sample["negative_valid"] = False
         if repeated_negative_start_s is not None and repeated_negative_end_s is not None:
             sample["repeated_negative_start_s"] = float(repeated_negative_start_s)
             sample["repeated_negative_end_s"] = float(repeated_negative_end_s)
+        if "false_row" in locals() and false_row is not None:
+            sample["negative_source"] = "false_destination"
+            sample["false_destination_event_id"] = false_row.event_id
+            sample["false_destination_gt_b_s"] = false_row.gt_b_s
+            sample["false_destination_pred_b_s"] = false_row.pred_b_s
+            sample["false_destination_abs_error_ms"] = false_row.abs_error_ms
+        elif spec_neg is not None:
+            sample["negative_source"] = "repeated_section"
         if window is not None:
             anchor_frames_a, anchor_frames_b = self._anchor_frames_for_window(window, spec_a.shape[1], spec_b.shape[1])
             teacher_frames_a, teacher_frames_b = self._teacher_frames_for_bounds(
@@ -790,9 +828,89 @@ class SWDPairDataset(Dataset):
         windows = self._windows_by_pair_id.get(pair.pair_id, [])
         if not windows:
             return None
+        false_destination_windows = [
+            window for window in windows if self._false_destination_candidates_for_window(pair, window)
+        ]
+        if false_destination_windows:
+            windows = false_destination_windows
         if self.deterministic:
             return windows[len(windows) // 2]
         return windows[int(self._rng.integers(0, len(windows)))]
+
+    def _load_false_destination_negatives(self) -> dict[str, list[FalseDestinationNegative]]:
+        if self.false_destination_negative_root is None:
+            return {}
+        path = self.false_destination_negative_root
+        if path.is_dir():
+            path = path / "false_destinations.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"False-destination negative CSV not found: {path}")
+
+        required = {"pair_id", "event_id", "gt_a_s", "gt_b_s", "pred_b_s", "abs_error_ms", "error_sign"}
+        by_pair: dict[str, list[FalseDestinationNegative]] = {}
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            missing = required.difference(reader.fieldnames or ())
+            if missing:
+                raise ValueError(
+                    f"False-destination negative CSV {path} is missing columns: "
+                    + ", ".join(sorted(missing))
+                )
+            for row in reader:
+                try:
+                    abs_error_ms = float(row["abs_error_ms"])
+                    negative = FalseDestinationNegative(
+                        pair_id=str(row["pair_id"]),
+                        event_id=str(row["event_id"]),
+                        gt_a_s=float(row["gt_a_s"]),
+                        gt_b_s=float(row["gt_b_s"]),
+                        pred_b_s=float(row["pred_b_s"]),
+                        abs_error_ms=abs_error_ms,
+                        error_sign=str(row["error_sign"]),
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite([negative.gt_a_s, negative.gt_b_s, negative.pred_b_s, abs_error_ms]).all():
+                    continue
+                if abs_error_ms < self.false_destination_min_error_ms:
+                    continue
+                by_pair.setdefault(negative.pair_id, []).append(negative)
+
+        for rows in by_pair.values():
+            rows.sort(key=lambda item: item.abs_error_ms, reverse=True)
+        if not by_pair:
+            logger.warning("No false-destination negatives loaded from %s", path)
+        else:
+            logger.info("Loaded %s false-destination negatives from %s", sum(len(v) for v in by_pair.values()), path)
+        return by_pair
+
+    def _false_destination_candidates_for_window(
+        self,
+        pair: SWDPair,
+        window: AlignedMeasureWindow,
+    ) -> list[FalseDestinationNegative]:
+        rows = self._false_destination_negatives.get(pair.pair_id, [])
+        if not rows:
+            return []
+        return [
+            row
+            for row in rows
+            if window.start_b_s <= row.gt_b_s <= window.end_b_s
+        ]
+
+    def _select_false_destination_negative(
+        self,
+        pair: SWDPair,
+        window: AlignedMeasureWindow,
+    ) -> FalseDestinationNegative | None:
+        candidates = self._false_destination_candidates_for_window(pair, window)
+        if not candidates:
+            return None
+        if self.deterministic:
+            return candidates[0]
+        weights = np.asarray([max(row.abs_error_ms, 1.0) for row in candidates], dtype=np.float64)
+        weights = weights / weights.sum()
+        return candidates[int(self._rng.choice(len(candidates), p=weights))]
 
     def _select_teacher_path_window(self, pair: SWDPair) -> TeacherPathWindow | None:
         teacher = self._load_teacher_path(pair)
@@ -994,6 +1112,35 @@ class SWDPairDataset(Dataset):
         )
         return spec.astype(np.float32, copy=False), float(start_s), float(end_s)
 
+    def _false_destination_negative_spec(
+        self,
+        log_cqt: NDArray[np.floating],
+        pair: SWDPair,
+        window: AlignedMeasureWindow,
+    ) -> tuple[NDArray[np.float32], float, float, FalseDestinationNegative] | None:
+        false_destination = self._select_false_destination_negative(pair, window)
+        if false_destination is None:
+            return None
+        n_frames = int(log_cqt.shape[1]) if log_cqt.ndim >= 2 else 0
+        if n_frames <= 0:
+            return None
+        total_duration_s = max(float(n_frames * self.hop_length / self.sr), 1.0 / self.sr)
+        start_s, end_s = self._false_destination_negative_bounds(
+            false_destination,
+            window,
+            total_duration_s=total_duration_s,
+        )
+        spec = standardize_log_cqt(
+            slice_log_cqt(
+                log_cqt,
+                start_s=start_s,
+                end_s=end_s,
+                sr=self.sr,
+                hop_length=self.hop_length,
+            )
+        )
+        return spec.astype(np.float32, copy=False), float(start_s), float(end_s), false_destination
+
     def _repeated_hard_negative_audio(
         self,
         audio: NDArray[np.floating],
@@ -1021,6 +1168,48 @@ class SWDPairDataset(Dataset):
             float(start_s),
             float(end_s),
         )
+
+    def _false_destination_negative_audio(
+        self,
+        audio: NDArray[np.floating],
+        pair: SWDPair,
+        window: AlignedMeasureWindow,
+    ) -> tuple[NDArray[np.float32], float, float, FalseDestinationNegative] | None:
+        false_destination = self._select_false_destination_negative(pair, window)
+        if false_destination is None:
+            return None
+        waveform = np.asarray(audio, dtype=np.float32)
+        if waveform.size == 0:
+            return None
+        total_duration_s = max(float(waveform.size / self.sr), 1.0 / self.sr)
+        start_s, end_s = self._false_destination_negative_bounds(
+            false_destination,
+            window,
+            total_duration_s=total_duration_s,
+        )
+        return (
+            self._crop_audio_window(waveform, start_s, end_s).astype(np.float32, copy=False),
+            float(start_s),
+            float(end_s),
+            false_destination,
+        )
+
+    def _false_destination_negative_bounds(
+        self,
+        false_destination: FalseDestinationNegative,
+        window: AlignedMeasureWindow,
+        *,
+        total_duration_s: float,
+    ) -> tuple[float, float]:
+        duration_s = min(
+            max(float(window.end_b_s - window.start_b_s), 1.0 / self.sr),
+            float(total_duration_s),
+        )
+        max_start_s = max(0.0, float(total_duration_s) - duration_s)
+        relative_b_s = float(false_destination.gt_b_s - window.start_b_s)
+        start_s = float(false_destination.pred_b_s - relative_b_s)
+        start_s = float(np.clip(start_s, 0.0, max_start_s))
+        return start_s, start_s + duration_s
 
     def _sample_repeated_negative_start_s(
         self,
@@ -1125,7 +1314,13 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
     pair_ids = []
     has_neg = any("spec_neg" in item for item in batch)
     has_reconstruction = any("reconstruction_target_a" in item for item in batch)
-    max_len_neg = max((item["spec_neg"].shape[-1] for item in batch if "spec_neg" in item), default=0)
+    max_len_neg = max(
+        (
+            item["spec_neg"].shape[-1] if "spec_neg" in item else item["spec_a"].shape[-1]
+            for item in batch
+        ),
+        default=0,
+    )
 
     for item in batch:
         sa = item["spec_a"]
@@ -1152,6 +1347,8 @@ def collate_variable_length(batch: list[dict]) -> dict[str, Any]:
             pad_neg = max_len_neg - sn.shape[-1]
             if pad_neg > 0:
                 sn = torch.nn.functional.pad(sn, (0, pad_neg))
+            elif pad_neg < 0:
+                sn = sn[..., :max_len_neg]
             specs_neg.append(sn)
             lengths_neg.append(int(item.get("spec_neg", item["spec_a"]).shape[-1]))
 

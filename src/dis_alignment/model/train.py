@@ -169,6 +169,9 @@ def train(
     cycle_smoothness_loss_weight: float = 0.0,
     hard_negative_loss_weight: float = 0.0,
     hard_negative_radius_frames: int = 96,
+    false_destination_negative_loss_weight: float = 0.0,
+    false_destination_negative_root: str | None = None,
+    false_destination_min_error_ms: float = 500.0,
     memory_bank_size: int = 0,
     teacher_path_root: str | None = None,
     self_mined_path_root: str | None = None,
@@ -217,6 +220,8 @@ def train(
         or path_distill_loss_weight > 0
         or soft_path_distill_loss_weight > 0
     )
+    if false_destination_negative_loss_weight > 0 and false_destination_negative_root is None:
+        raise ValueError("false_destination_negative_loss_weight requires false_destination_negative_root.")
     if augment and disable_time_stretch_for_anchors and supervised_anchor_training:
         augmentor_kwargs = dict(augmentor_kwargs)
         augmentor_kwargs["time_stretch_range"] = (1.0, 1.0)
@@ -270,7 +275,12 @@ def train(
         train_augmentor = AudioAugmentor(**augmentor_kwargs) if augment else None
         emit_repeated_hard_negatives = (
             hard_negative_loss_weight > 0
+            and false_destination_negative_loss_weight <= 0
             and segment_sampling in {"aligned_measures", "teacher_path", "self_mined_path"}
+        )
+        emit_false_destination_negatives = (
+            false_destination_negative_loss_weight > 0
+            and false_destination_negative_root is not None
         )
         train_dataset = SWDPairDataset(
             swd,
@@ -289,6 +299,8 @@ def train(
             if (path_distill_loss_weight > 0 or soft_path_distill_loss_weight > 0)
             else None,
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
+            false_destination_negative_root=false_destination_negative_root if emit_false_destination_negatives else None,
+            false_destination_min_error_ms=false_destination_min_error_ms,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
             relative_offset_bins=list(resolved_relative_offset_bins),
@@ -316,6 +328,8 @@ def train(
             )
             else None,
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
+            false_destination_negative_root=false_destination_negative_root if emit_false_destination_negatives else None,
+            false_destination_min_error_ms=false_destination_min_error_ms,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
             relative_offset_bins=list(resolved_relative_offset_bins),
@@ -413,7 +427,7 @@ def train(
     )
     hard_negative_loss_fn = (
         HardNegativeContrastiveLoss().to(dev)
-        if hard_negative_loss_weight > 0
+        if hard_negative_loss_weight > 0 or false_destination_negative_loss_weight > 0
         else None
     )
     reconstruction_loss_fn = (
@@ -491,6 +505,11 @@ def train(
         "cycle_smoothness_loss_weight": cycle_smoothness_loss_weight,
         "hard_negative_loss_weight": hard_negative_loss_weight,
         "hard_negative_radius_frames": hard_negative_radius_frames,
+        "false_destination_negative_loss_weight": false_destination_negative_loss_weight,
+        "false_destination_negative_root": (
+            str(false_destination_negative_root) if false_destination_negative_root is not None else None
+        ),
+        "false_destination_min_error_ms": false_destination_min_error_ms,
         "memory_bank_size": memory_bank_size,
         "teacher_path_root": str(teacher_path_root) if teacher_path_root is not None else None,
         "self_mined_path_root": str(self_mined_path_root) if self_mined_path_root is not None else None,
@@ -543,6 +562,7 @@ def train(
         train_cycle_monotonicity_loss = 0.0
         train_cycle_smoothness_loss = 0.0
         train_hard_negative_loss = 0.0
+        train_false_destination_negative_loss = 0.0
         n_batches = 0
 
         for batch in train_loader:
@@ -554,6 +574,7 @@ def train(
             lengths_a = batch.get("lengths_a")
             lengths_b = batch.get("lengths_b")
             lengths_neg = batch.get("lengths_neg")
+            negative_valid = batch.get("negative_valid")
             anchor_frames_a = batch.get("anchor_frame_indices_a")
             anchor_frames_b = batch.get("anchor_frame_indices_b")
             teacher_frames_a = batch.get("teacher_frame_indices_a")
@@ -619,6 +640,7 @@ def train(
                 relative_offset_component = emb_a.new_zeros(())
                 masked_reconstruction_component = emb_a.new_zeros(())
                 hard_negative_component = emb_a.new_zeros(())
+                false_destination_negative_component = emb_a.new_zeros(())
                 emb_neg = None
                 if spec_neg is not None and (
                     hard_negative_loss_fn is not None
@@ -664,15 +686,24 @@ def train(
                         )
                         loss = loss + (masked_reconstruction_loss_weight * masked_reconstruction_component)
                 if hard_negative_loss_fn is not None and emb_neg is not None:
-                    hard_negative_component = hard_negative_loss_fn(
+                    negative_component = hard_negative_loss_fn(
                         emb_a,
                         emb_b,
                         emb_neg,
                         lengths_a=lengths_a,
                         lengths_b=lengths_b,
                         lengths_neg=lengths_neg,
+                        valid_mask=negative_valid,
                     )
-                    loss = loss + (hard_negative_loss_weight * hard_negative_component)
+                    if hard_negative_loss_weight > 0:
+                        hard_negative_component = negative_component
+                        loss = loss + (hard_negative_loss_weight * hard_negative_component)
+                    if false_destination_negative_loss_weight > 0:
+                        false_destination_negative_component = negative_component
+                        loss = loss + (
+                            false_destination_negative_loss_weight
+                            * false_destination_negative_component
+                        )
                 cycle_consistency_component = emb_a.new_zeros(())
                 cycle_entropy_component = emb_a.new_zeros(())
                 cycle_monotonicity_component = emb_a.new_zeros(())
@@ -715,6 +746,7 @@ def train(
             train_cycle_monotonicity_loss += float(cycle_monotonicity_component.item())
             train_cycle_smoothness_loss += float(cycle_smoothness_component.item())
             train_hard_negative_loss += float(hard_negative_component.item())
+            train_false_destination_negative_loss += float(false_destination_negative_component.item())
             n_batches += 1
 
         train_loss /= max(n_batches, 1)
@@ -733,6 +765,7 @@ def train(
         train_cycle_monotonicity_loss /= max(n_batches, 1)
         train_cycle_smoothness_loss /= max(n_batches, 1)
         train_hard_negative_loss /= max(n_batches, 1)
+        train_false_destination_negative_loss /= max(n_batches, 1)
         history["train_loss"].append(train_loss)
         history["train_soft_dtw_loss"].append(train_soft_dtw_loss)
         history["train_anchor_loss"].append(train_anchor_loss)
@@ -749,6 +782,7 @@ def train(
         history["train_cycle_monotonicity_loss"].append(train_cycle_monotonicity_loss)
         history["train_cycle_smoothness_loss"].append(train_cycle_smoothness_loss)
         history["train_hard_negative_loss"].append(train_hard_negative_loss)
+        history["train_false_destination_negative_loss"].append(train_false_destination_negative_loss)
 
         model.eval()
         val_loss = 0.0
@@ -763,6 +797,7 @@ def train(
                 lengths_a = batch.get("lengths_a")
                 lengths_b = batch.get("lengths_b")
                 lengths_neg = batch.get("lengths_neg")
+                negative_valid = batch.get("negative_valid")
                 emb_a, emb_b = model(spec_a, spec_b)
                 if criterion is not None:
                     loss = criterion(emb_a, emb_b, lengths_a=lengths_a, lengths_b=lengths_b)
@@ -871,17 +906,17 @@ def train(
                             )
                         )
                 if hard_negative_loss_fn is not None and emb_neg is not None:
-                    loss = loss + (
-                        hard_negative_loss_weight
-                        * hard_negative_loss_fn(
-                            emb_a,
-                            emb_b,
-                            emb_neg,
-                            lengths_a=lengths_a,
-                            lengths_b=lengths_b,
-                            lengths_neg=lengths_neg,
-                        )
+                    negative_loss = hard_negative_loss_fn(
+                        emb_a,
+                        emb_b,
+                        emb_neg,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                        lengths_neg=lengths_neg,
+                        valid_mask=negative_valid,
                     )
+                    loss = loss + (hard_negative_loss_weight * negative_loss)
+                    loss = loss + (false_destination_negative_loss_weight * negative_loss)
                 if cycle_loss_fn is not None:
                     cycle_components = cycle_loss_fn(
                         emb_a,
@@ -970,7 +1005,7 @@ def train(
             "Epoch %s/%s | Train: %.4f | SoftDTW: %.4f | Anchor: %.4f | "
             "Dense: %.4f | Distill: %.4f | SoftPath: %.4f | Seq: %.4f | AntiCollapse: %.4f | "
             "Order: %.4f | Offset: %.4f | Recon: %.4f | Cycle: %.4f/%.4f/%.4f/%.4f | HardNeg: %.4f | "
-            "Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
+            "FalseDest: %.4f | Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
             "Debug AR@100: %.4f | Val MAE: %.4f | Val AR@50: %.4f | Val AR@100: %.4f | "
             "gamma: %.4f | LR: %.2e | Time: %.1fs",
             epoch + 1,
@@ -991,6 +1026,7 @@ def train(
             train_cycle_monotonicity_loss,
             train_cycle_smoothness_loss,
             train_hard_negative_loss,
+            train_false_destination_negative_loss,
             val_loss,
             debug_metrics["mae"],
             debug_metrics["ar_50ms"],
@@ -1067,6 +1103,9 @@ def train(
                 "cycle_smoothness_loss_weight": cycle_smoothness_loss_weight,
                 "hard_negative_loss_weight": hard_negative_loss_weight,
                 "hard_negative_radius_frames": hard_negative_radius_frames,
+                "false_destination_negative_loss_weight": false_destination_negative_loss_weight,
+                "false_destination_negative_root": false_destination_negative_root,
+                "false_destination_min_error_ms": false_destination_min_error_ms,
                 "memory_bank_size": memory_bank_size,
                 "teacher_path_root": teacher_path_root,
                 "self_mined_path_root": self_mined_path_root,
@@ -1151,6 +1190,9 @@ def train(
                         "cycle_smoothness_loss_weight": cycle_smoothness_loss_weight,
                         "hard_negative_loss_weight": hard_negative_loss_weight,
                         "hard_negative_radius_frames": hard_negative_radius_frames,
+                        "false_destination_negative_loss_weight": false_destination_negative_loss_weight,
+                        "false_destination_negative_root": false_destination_negative_root,
+                        "false_destination_min_error_ms": false_destination_min_error_ms,
                         "memory_bank_size": memory_bank_size,
                         "teacher_path_root": teacher_path_root,
                         "self_mined_path_root": self_mined_path_root,
@@ -1207,6 +1249,7 @@ def _empty_history() -> dict[str, list[float]]:
         "train_cycle_monotonicity_loss": [],
         "train_cycle_smoothness_loss": [],
         "train_hard_negative_loss": [],
+        "train_false_destination_negative_loss": [],
         "val_loss": [],
         "debug_mae": [],
         "debug_ar50": [],
@@ -1344,6 +1387,9 @@ def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None
     normalised.setdefault("cycle_smoothness_loss_weight", 0.0)
     normalised.setdefault("hard_negative_loss_weight", 0.0)
     normalised.setdefault("hard_negative_radius_frames", 96)
+    normalised.setdefault("false_destination_negative_loss_weight", 0.0)
+    normalised.setdefault("false_destination_negative_root", None)
+    normalised.setdefault("false_destination_min_error_ms", 500.0)
     normalised.setdefault("memory_bank_size", 0)
     normalised.setdefault("teacher_path_root", None)
     normalised.setdefault("self_mined_path_root", None)
@@ -1833,6 +1879,21 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("hard_negative_radius_frames"),
             96,
         ),
+        "false_destination_negative_loss_weight": _resolve_option(
+            getattr(args, "false_destination_negative_loss_weight", None),
+            training_cfg.get("false_destination_negative_loss_weight"),
+            0.0,
+        ),
+        "false_destination_negative_root": _resolve_option(
+            getattr(args, "false_destination_negative_root", None),
+            training_cfg.get("false_destination_negative_root"),
+            None,
+        ),
+        "false_destination_min_error_ms": _resolve_option(
+            getattr(args, "false_destination_min_error_ms", None),
+            training_cfg.get("false_destination_min_error_ms"),
+            500.0,
+        ),
         "memory_bank_size": _resolve_option(
             getattr(args, "memory_bank_size", None),
             training_cfg.get("memory_bank_size"),
@@ -1973,6 +2034,9 @@ def main() -> None:
     parser.add_argument("--cycle-smoothness-loss-weight", type=float, default=None)
     parser.add_argument("--hard-negative-loss-weight", type=float, default=None)
     parser.add_argument("--hard-negative-radius-frames", type=int, default=None)
+    parser.add_argument("--false-destination-negative-loss-weight", type=float, default=None)
+    parser.add_argument("--false-destination-negative-root", type=str, default=None)
+    parser.add_argument("--false-destination-min-error-ms", type=float, default=None)
     parser.add_argument("--memory-bank-size", type=int, default=None)
     parser.add_argument("--teacher-path-root", type=str, default=None)
     parser.add_argument("--self-mined-path-root", type=str, default=None)

@@ -241,6 +241,28 @@ def test_original_plan_repeated_negative_stage_uses_distant_negatives():
     assert evaluation["pool_size"] == 1
 
 
+def test_original_plan_false_destination_stage_uses_mined_negatives():
+    from dis_alignment.model.train import _load_training_config
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = _load_training_config(repo_root / "config" / "deepalign_initial_plan_supervised_false_dest_stage2.yaml")
+    training = config["training"]
+    evaluation = config["evaluation"]
+
+    assert config["dataset"]["segment_sampling"] == "aligned_measures"
+    assert config["dataset"]["max_length_sec"] == 4.0
+    assert config["dataset"]["samples_per_epoch"] == 256
+    assert training["resume_from"] == "checkpoints/initial_plan_supervised_20ms/best_model_balanced.pt"
+    assert training["path_distill_loss_weight"] > 0.0
+    assert training["hard_negative_loss_weight"] == 0.0
+    assert training["false_destination_negative_loss_weight"] == 0.05
+    assert training["false_destination_negative_root"].endswith("local_transfer_train_false_destinations.csv")
+    assert training["false_destination_min_error_ms"] == 500.0
+    assert training["soft_path_distill_loss_weight"] == 0.0
+    assert evaluation["deep_decode"] == "unconstrained"
+    assert evaluation["pool_size"] == 1
+
+
 def test_strict_ablation_runner_does_not_weaken_final_gate():
     repo_root = Path(__file__).resolve().parents[1]
     runner = (repo_root / "scripts" / "run_initial_claim_strict_audio_only_sprint.ps1").read_text(encoding="utf-8")
