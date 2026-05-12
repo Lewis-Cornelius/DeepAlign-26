@@ -25,6 +25,7 @@ from dis_alignment.model.anchor_loss import (
     MaskedReconstructionLoss,
     PathDistillationLoss,
     SequenceContrastiveLoss,
+    SoftPathDistillationLoss,
 )
 from dis_alignment.model.encoder import CRNNEncoder, DeepAlignModel
 from dis_alignment.model.recovery import normalize_debug_lied_ids
@@ -152,6 +153,9 @@ def train(
     anchor_loss_weight: float = 0.0,
     dense_anchor_loss_weight: float = 0.0,
     path_distill_loss_weight: float = 0.0,
+    soft_path_distill_loss_weight: float = 0.0,
+    soft_path_temperature: float = 0.05,
+    soft_path_target_sigma_frames: float = 2.0,
     sequence_contrastive_loss_weight: float = 0.0,
     anti_collapse_loss_weight: float = 0.0,
     anti_collapse_covariance_weight: float = 0.01,
@@ -211,6 +215,7 @@ def train(
         anchor_loss_weight > 0
         or dense_anchor_loss_weight > 0
         or path_distill_loss_weight > 0
+        or soft_path_distill_loss_weight > 0
     )
     if augment and disable_time_stretch_for_anchors and supervised_anchor_training:
         augmentor_kwargs = dict(augmentor_kwargs)
@@ -276,7 +281,9 @@ def train(
             deterministic=False,
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
-            teacher_path_root=teacher_path_root if path_distill_loss_weight > 0 else None,
+            teacher_path_root=teacher_path_root
+            if (path_distill_loss_weight > 0 or soft_path_distill_loss_weight > 0)
+            else None,
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
@@ -297,7 +304,11 @@ def train(
             cache_spectrograms=cache_spectrograms,
             cache_root=resolved_cache_root,
             teacher_path_root=teacher_path_root
-            if (segment_sampling == "teacher_path" or path_distill_loss_weight > 0)
+            if (
+                segment_sampling == "teacher_path"
+                or path_distill_loss_weight > 0
+                or soft_path_distill_loss_weight > 0
+            )
             else None,
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             num_teacher_samples=num_anchor_samples,
@@ -376,6 +387,14 @@ def train(
         if path_distill_loss_weight > 0
         else None
     )
+    soft_path_distill_loss_fn = (
+        SoftPathDistillationLoss(
+            temperature=soft_path_temperature,
+            target_sigma_frames=soft_path_target_sigma_frames,
+        ).to(dev)
+        if soft_path_distill_loss_weight > 0
+        else None
+    )
     sequence_contrastive_loss_fn = (
         SequenceContrastiveLoss(temperature=anchor_temperature).to(dev)
         if sequence_contrastive_loss_weight > 0
@@ -450,6 +469,9 @@ def train(
         "anchor_loss_weight": anchor_loss_weight,
         "dense_anchor_loss_weight": dense_anchor_loss_weight,
         "path_distill_loss_weight": path_distill_loss_weight,
+        "soft_path_distill_loss_weight": soft_path_distill_loss_weight,
+        "soft_path_temperature": soft_path_temperature,
+        "soft_path_target_sigma_frames": soft_path_target_sigma_frames,
         "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
         "anti_collapse_loss_weight": anti_collapse_loss_weight,
         "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
@@ -504,6 +526,7 @@ def train(
         train_anchor_loss = 0.0
         train_dense_anchor_loss = 0.0
         train_path_distill_loss = 0.0
+        train_soft_path_distill_loss = 0.0
         train_sequence_contrastive_loss = 0.0
         train_anti_collapse_loss = 0.0
         train_temporal_order_loss = 0.0
@@ -556,6 +579,17 @@ def train(
                 if path_distill_loss_fn is not None:
                     path_distill_component = path_distill_loss_fn(emb_a, emb_b, teacher_frames_a, teacher_frames_b)
                     loss = loss + (path_distill_loss_weight * path_distill_component)
+                soft_path_distill_component = emb_a.new_zeros(())
+                if soft_path_distill_loss_fn is not None:
+                    soft_path_distill_component = soft_path_distill_loss_fn(
+                        emb_a,
+                        emb_b,
+                        teacher_frames_a,
+                        teacher_frames_b,
+                        lengths_a=lengths_a,
+                        lengths_b=lengths_b,
+                    )
+                    loss = loss + (soft_path_distill_loss_weight * soft_path_distill_component)
                 sequence_component = emb_a.new_zeros(())
                 if sequence_contrastive_loss_fn is not None:
                     sequence_component = sequence_contrastive_loss_fn(
@@ -664,6 +698,7 @@ def train(
             train_anchor_loss += float(anchor_component.item())
             train_dense_anchor_loss += float(dense_anchor_component.item())
             train_path_distill_loss += float(path_distill_component.item())
+            train_soft_path_distill_loss += float(soft_path_distill_component.item())
             train_sequence_contrastive_loss += float(sequence_component.item())
             train_anti_collapse_loss += float(anti_collapse_component.item())
             train_temporal_order_loss += float(temporal_order_component.item())
@@ -681,6 +716,7 @@ def train(
         train_anchor_loss /= max(n_batches, 1)
         train_dense_anchor_loss /= max(n_batches, 1)
         train_path_distill_loss /= max(n_batches, 1)
+        train_soft_path_distill_loss /= max(n_batches, 1)
         train_sequence_contrastive_loss /= max(n_batches, 1)
         train_anti_collapse_loss /= max(n_batches, 1)
         train_temporal_order_loss /= max(n_batches, 1)
@@ -696,6 +732,7 @@ def train(
         history["train_anchor_loss"].append(train_anchor_loss)
         history["train_dense_anchor_loss"].append(train_dense_anchor_loss)
         history["train_path_distill_loss"].append(train_path_distill_loss)
+        history["train_soft_path_distill_loss"].append(train_soft_path_distill_loss)
         history["train_sequence_contrastive_loss"].append(train_sequence_contrastive_loss)
         history["train_anti_collapse_loss"].append(train_anti_collapse_loss)
         history["train_temporal_order_loss"].append(train_temporal_order_loss)
@@ -744,6 +781,18 @@ def train(
                     loss = loss + (
                         path_distill_loss_weight
                         * path_distill_loss_fn(emb_a, emb_b, teacher_frames_a, teacher_frames_b)
+                    )
+                if soft_path_distill_loss_fn is not None:
+                    loss = loss + (
+                        soft_path_distill_loss_weight
+                        * soft_path_distill_loss_fn(
+                            emb_a,
+                            emb_b,
+                            teacher_frames_a,
+                            teacher_frames_b,
+                            lengths_a=lengths_a,
+                            lengths_b=lengths_b,
+                        )
                     )
                 if sequence_contrastive_loss_fn is not None:
                     loss = loss + (
@@ -913,7 +962,7 @@ def train(
 
         logger.info(
             "Epoch %s/%s | Train: %.4f | SoftDTW: %.4f | Anchor: %.4f | "
-            "Dense: %.4f | Distill: %.4f | Seq: %.4f | AntiCollapse: %.4f | "
+            "Dense: %.4f | Distill: %.4f | SoftPath: %.4f | Seq: %.4f | AntiCollapse: %.4f | "
             "Order: %.4f | Offset: %.4f | Recon: %.4f | Cycle: %.4f/%.4f/%.4f/%.4f | HardNeg: %.4f | "
             "Val: %.4f | Debug MAE: %.4f | Debug AR@50: %.4f | "
             "Debug AR@100: %.4f | Val MAE: %.4f | Val AR@50: %.4f | Val AR@100: %.4f | "
@@ -925,6 +974,7 @@ def train(
             train_anchor_loss,
             train_dense_anchor_loss,
             train_path_distill_loss,
+            train_soft_path_distill_loss,
             train_sequence_contrastive_loss,
             train_anti_collapse_loss,
             train_temporal_order_loss,
@@ -995,6 +1045,9 @@ def train(
                 "anchor_loss_weight": anchor_loss_weight,
                 "dense_anchor_loss_weight": dense_anchor_loss_weight,
                 "path_distill_loss_weight": path_distill_loss_weight,
+                "soft_path_distill_loss_weight": soft_path_distill_loss_weight,
+                "soft_path_temperature": soft_path_temperature,
+                "soft_path_target_sigma_frames": soft_path_target_sigma_frames,
                 "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
                 "anti_collapse_loss_weight": anti_collapse_loss_weight,
                 "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
@@ -1076,6 +1129,9 @@ def train(
                         "anchor_loss_weight": anchor_loss_weight,
                         "dense_anchor_loss_weight": dense_anchor_loss_weight,
                         "path_distill_loss_weight": path_distill_loss_weight,
+                        "soft_path_distill_loss_weight": soft_path_distill_loss_weight,
+                        "soft_path_temperature": soft_path_temperature,
+                        "soft_path_target_sigma_frames": soft_path_target_sigma_frames,
                         "sequence_contrastive_loss_weight": sequence_contrastive_loss_weight,
                         "anti_collapse_loss_weight": anti_collapse_loss_weight,
                         "anti_collapse_covariance_weight": anti_collapse_covariance_weight,
@@ -1134,6 +1190,7 @@ def _empty_history() -> dict[str, list[float]]:
         "train_anchor_loss": [],
         "train_dense_anchor_loss": [],
         "train_path_distill_loss": [],
+        "train_soft_path_distill_loss": [],
         "train_sequence_contrastive_loss": [],
         "train_anti_collapse_loss": [],
         "train_temporal_order_loss": [],
@@ -1265,6 +1322,9 @@ def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None
     normalised.setdefault("dense_anchor_loss_weight", 0.0)
     normalised.setdefault("soft_dtw_loss_weight", 1.0)
     normalised.setdefault("path_distill_loss_weight", 0.0)
+    normalised.setdefault("soft_path_distill_loss_weight", 0.0)
+    normalised.setdefault("soft_path_temperature", 0.05)
+    normalised.setdefault("soft_path_target_sigma_frames", 2.0)
     normalised.setdefault("sequence_contrastive_loss_weight", 0.0)
     normalised.setdefault("anti_collapse_loss_weight", 0.0)
     normalised.setdefault("anti_collapse_covariance_weight", 0.01)
@@ -1687,6 +1747,21 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("path_distill_loss_weight"),
             0.0,
         ),
+        "soft_path_distill_loss_weight": _resolve_option(
+            getattr(args, "soft_path_distill_loss_weight", None),
+            training_cfg.get("soft_path_distill_loss_weight"),
+            0.0,
+        ),
+        "soft_path_temperature": _resolve_option(
+            getattr(args, "soft_path_temperature", None),
+            training_cfg.get("soft_path_temperature"),
+            0.05,
+        ),
+        "soft_path_target_sigma_frames": _resolve_option(
+            getattr(args, "soft_path_target_sigma_frames", None),
+            training_cfg.get("soft_path_target_sigma_frames"),
+            2.0,
+        ),
         "sequence_contrastive_loss_weight": _resolve_option(
             getattr(args, "sequence_contrastive_loss_weight", None),
             training_cfg.get("sequence_contrastive_loss_weight"),
@@ -1876,6 +1951,9 @@ def main() -> None:
     parser.add_argument("--anchor-loss-weight", type=float, default=None)
     parser.add_argument("--dense-anchor-loss-weight", type=float, default=None)
     parser.add_argument("--path-distill-loss-weight", type=float, default=None)
+    parser.add_argument("--soft-path-distill-loss-weight", type=float, default=None)
+    parser.add_argument("--soft-path-temperature", type=float, default=None)
+    parser.add_argument("--soft-path-target-sigma-frames", type=float, default=None)
     parser.add_argument("--sequence-contrastive-loss-weight", type=float, default=None)
     parser.add_argument("--anti-collapse-loss-weight", type=float, default=None)
     parser.add_argument("--anti-collapse-covariance-weight", type=float, default=None)

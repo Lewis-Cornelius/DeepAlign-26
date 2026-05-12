@@ -340,6 +340,35 @@ class TestPathDistillationLoss:
 
         assert loss.item() == pytest.approx(0.0)
 
+    def test_soft_path_distillation_prefers_teacher_route(self):
+        from dis_alignment.model.anchor_loss import SoftPathDistillationLoss
+
+        loss_fn = SoftPathDistillationLoss(temperature=0.05, target_sigma_frames=0.0)
+        emb = torch.eye(8).unsqueeze(0)
+
+        good = loss_fn(emb, emb.clone(), [[1, 3, 5]], [[1, 3, 5]])
+        bad = loss_fn(emb, emb.flip(dims=[1]), [[1, 3, 5]], [[1, 3, 5]])
+
+        assert good.item() < 0.01
+        assert bad.item() > good.item()
+
+    def test_soft_path_distillation_uses_lengths(self):
+        from dis_alignment.model.anchor_loss import SoftPathDistillationLoss
+
+        loss_fn = SoftPathDistillationLoss(temperature=0.1, target_sigma_frames=1.0)
+        emb = torch.eye(6).unsqueeze(0)
+
+        loss = loss_fn(
+            emb,
+            emb.clone(),
+            [[1, 2, 5]],
+            [[1, 2, 5]],
+            lengths_a=torch.tensor([3]),
+            lengths_b=torch.tensor([3]),
+        )
+
+        assert torch.isfinite(loss)
+
 
 class TestStrictAudioOnlyLosses:
     """Tests for strict self-supervised headline losses."""
@@ -1326,6 +1355,9 @@ class TestTrainingPairSplit:
             "training:\n"
             "  dense_anchor_loss_weight: 0.15\n"
             "  path_distill_loss_weight: 0.75\n"
+            "  soft_path_distill_loss_weight: 0.25\n"
+            "  soft_path_temperature: 0.07\n"
+            "  soft_path_target_sigma_frames: 3.0\n"
             "  teacher_path_root: results/teacher/paths\n"
             "  num_anchor_samples: 96\n"
             "  teacher_min_confidence: 0.6\n"
@@ -1395,6 +1427,9 @@ class TestTrainingPairSplit:
 
         assert kwargs["dense_anchor_loss_weight"] == pytest.approx(0.15)
         assert kwargs["path_distill_loss_weight"] == pytest.approx(0.75)
+        assert kwargs["soft_path_distill_loss_weight"] == pytest.approx(0.25)
+        assert kwargs["soft_path_temperature"] == pytest.approx(0.07)
+        assert kwargs["soft_path_target_sigma_frames"] == pytest.approx(3.0)
         assert kwargs["soft_dtw_loss_weight"] == 0.0
         assert kwargs["teacher_path_root"] == "results/teacher/paths"
         assert kwargs["num_anchor_samples"] == 96

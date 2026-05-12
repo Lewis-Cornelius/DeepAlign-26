@@ -677,6 +677,9 @@ def _row_costs(query, candidates, *, distance: str):
 @click.option("--anchor-loss-weight", type=float, default=None, help="Optional anchor contrastive loss weight")
 @click.option("--dense-anchor-loss-weight", type=float, default=None, help="Dense measure-anchor contrastive loss weight")
 @click.option("--path-distill-loss-weight", type=float, default=None, help="Teacher-path distillation loss weight")
+@click.option("--soft-path-distill-loss-weight", type=float, default=None, help="Full-crop teacher path distillation weight")
+@click.option("--soft-path-temperature", type=float, default=None, help="Soft path distillation similarity temperature")
+@click.option("--soft-path-target-sigma-frames", type=float, default=None, help="Gaussian teacher path target width")
 @click.option("--sequence-contrastive-loss-weight", type=float, default=None, help="Same-lied sequence contrastive loss weight")
 @click.option("--anti-collapse-loss-weight", type=float, default=None, help="Embedding anti-collapse regularization weight")
 @click.option("--anti-collapse-covariance-weight", type=float, default=None, help="Covariance term inside anti-collapse regularization")
@@ -738,6 +741,9 @@ def train(
     anchor_loss_weight: float | None,
     dense_anchor_loss_weight: float | None,
     path_distill_loss_weight: float | None,
+    soft_path_distill_loss_weight: float | None,
+    soft_path_temperature: float | None,
+    soft_path_target_sigma_frames: float | None,
     sequence_contrastive_loss_weight: float | None,
     anti_collapse_loss_weight: float | None,
     anti_collapse_covariance_weight: float | None,
@@ -842,6 +848,17 @@ def train(
         anchor_loss_weight=_coalesce(anchor_loss_weight, training_cfg.get("anchor_loss_weight"), 0.0),
         dense_anchor_loss_weight=_coalesce(dense_anchor_loss_weight, training_cfg.get("dense_anchor_loss_weight"), 0.0),
         path_distill_loss_weight=_coalesce(path_distill_loss_weight, training_cfg.get("path_distill_loss_weight"), 0.0),
+        soft_path_distill_loss_weight=_coalesce(
+            soft_path_distill_loss_weight,
+            training_cfg.get("soft_path_distill_loss_weight"),
+            0.0,
+        ),
+        soft_path_temperature=_coalesce(soft_path_temperature, training_cfg.get("soft_path_temperature"), 0.05),
+        soft_path_target_sigma_frames=_coalesce(
+            soft_path_target_sigma_frames,
+            training_cfg.get("soft_path_target_sigma_frames"),
+            2.0,
+        ),
         sequence_contrastive_loss_weight=_coalesce(sequence_contrastive_loss_weight, training_cfg.get("sequence_contrastive_loss_weight"), 0.0),
         anti_collapse_loss_weight=_coalesce(anti_collapse_loss_weight, training_cfg.get("anti_collapse_loss_weight"), 0.0),
         anti_collapse_covariance_weight=_coalesce(anti_collapse_covariance_weight, training_cfg.get("anti_collapse_covariance_weight"), 0.01),

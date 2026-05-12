@@ -213,6 +213,115 @@ class PathDistillationLoss(AnchorContrastiveLoss):
         return [nn.functional.cross_entropy(logits, targets)]
 
 
+class SoftPathDistillationLoss(nn.Module):
+    """
+    Distill the teacher route over the full crop, not just local negatives.
+
+    For each sampled teacher correspondence, the query frame is classified
+    against every valid reference frame. A small Gaussian target around the
+    teacher frame lets near misses remain less costly than global jumps.
+    """
+
+    def __init__(self, temperature: float = 0.05, target_sigma_frames: float = 2.0):
+        super().__init__()
+        self.temperature = float(temperature)
+        self.target_sigma_frames = float(target_sigma_frames)
+
+    def forward(
+        self,
+        emb_a: Tensor,
+        emb_b: Tensor,
+        teacher_frames_a: Sequence[Sequence[int]] | None,
+        teacher_frames_b: Sequence[Sequence[int]] | None,
+        lengths_a: Tensor | Sequence[int] | None = None,
+        lengths_b: Tensor | Sequence[int] | None = None,
+    ) -> Tensor:
+        if not teacher_frames_a or not teacher_frames_b:
+            return emb_a.new_zeros(())
+
+        len_a = self._length_tensor(lengths_a, batch_size=emb_a.shape[0], max_len=emb_a.shape[1], device=emb_a.device)
+        len_b = self._length_tensor(lengths_b, batch_size=emb_b.shape[0], max_len=emb_b.shape[1], device=emb_b.device)
+        losses: list[Tensor] = []
+
+        for batch_idx in range(emb_a.shape[0]):
+            if batch_idx >= len(teacher_frames_a) or batch_idx >= len(teacher_frames_b):
+                break
+
+            frames_a = teacher_frames_a[batch_idx]
+            frames_b = teacher_frames_b[batch_idx]
+            if frames_a is None or frames_b is None or len(frames_a) == 0 or len(frames_b) == 0:
+                continue
+
+            n_a = int(len_a[batch_idx].item())
+            n_b = int(len_b[batch_idx].item())
+            if n_a < 2 or n_b < 2:
+                continue
+
+            idx_a = torch.as_tensor(frames_a, device=emb_a.device, dtype=torch.long)
+            idx_b = torch.as_tensor(frames_b, device=emb_b.device, dtype=torch.long)
+            n_points = min(idx_a.numel(), idx_b.numel())
+            if n_points == 0:
+                continue
+
+            idx_a = idx_a[:n_points].clamp_(0, n_a - 1)
+            idx_b = idx_b[:n_points].clamp_(0, n_b - 1)
+            losses.append(
+                self._directional_loss(
+                    queries=emb_a[batch_idx, :n_a],
+                    references=emb_b[batch_idx, :n_b],
+                    query_indices=idx_a,
+                    target_indices=idx_b,
+                )
+            )
+            losses.append(
+                self._directional_loss(
+                    queries=emb_b[batch_idx, :n_b],
+                    references=emb_a[batch_idx, :n_a],
+                    query_indices=idx_b,
+                    target_indices=idx_a,
+                )
+            )
+
+        valid_losses = [loss for loss in losses if loss.numel() > 0]
+        if not valid_losses:
+            return emb_a.new_zeros(())
+        return torch.stack(valid_losses).mean()
+
+    def _directional_loss(
+        self,
+        *,
+        queries: Tensor,
+        references: Tensor,
+        query_indices: Tensor,
+        target_indices: Tensor,
+    ) -> Tensor:
+        query_vecs = nn.functional.normalize(queries[query_indices], dim=-1)
+        reference_vecs = nn.functional.normalize(references, dim=-1)
+        logits = query_vecs @ reference_vecs.T / self.temperature
+
+        if self.target_sigma_frames <= 0:
+            return nn.functional.cross_entropy(logits, target_indices)
+
+        positions = torch.arange(references.shape[0], device=references.device, dtype=logits.dtype)
+        target_positions = target_indices.to(dtype=logits.dtype)[:, None]
+        sigma = max(float(self.target_sigma_frames), 1e-6)
+        target = torch.exp(-0.5 * ((positions[None, :] - target_positions) / sigma).pow(2))
+        target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        return -(target * nn.functional.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+
+    @staticmethod
+    def _length_tensor(
+        lengths: Tensor | Sequence[int] | None,
+        *,
+        batch_size: int,
+        max_len: int,
+        device: torch.device,
+    ) -> Tensor:
+        if lengths is None:
+            return torch.full((batch_size,), max_len, device=device, dtype=torch.long)
+        return torch.as_tensor(lengths, device=device, dtype=torch.long).clamp(min=0, max=max_len)
+
+
 class SequenceContrastiveLoss(nn.Module):
     """
     Contrast whole same-lied performance pairs against other lieder in the batch.
