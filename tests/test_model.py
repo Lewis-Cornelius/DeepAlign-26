@@ -740,6 +740,57 @@ class TestSWDPairDatasetSampling:
         assert item["false_destination_event_id"] == "2"
         assert item["repeated_negative_start_s"] == pytest.approx(24.0)
 
+    def test_false_destination_window_probability_can_keep_regular_windows(self, monkeypatch, tmp_path):
+        from dis_alignment.model import dataset as dataset_module
+        from dis_alignment.model.dataset import SWDPairDataset
+
+        _patch_aligned_sampling(monkeypatch)
+        pair = _make_pair(tmp_path, "D911-04")
+        false_destinations = tmp_path / "false_destinations.csv"
+        false_destinations.write_text(
+            "pair_id,event_id,gt_a_s,gt_b_s,pred_b_s,abs_error_ms,error_sign,source\n"
+            f"{pair.pair_id},4,28.0,25.0,5.0,2000.0,early,fresh_1000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            dataset_module,
+            "load_swd_audio",
+            lambda piece, sr=10: (np.arange(400, dtype=np.float32), sr),
+        )
+        monkeypatch.setattr(
+            dataset_module.SWDPairDataset,
+            "_compute_cqt",
+            lambda self, audio: np.tile(audio[::10][: max(1, len(audio) // 10)], (2, 1)).astype(np.float32),
+        )
+
+        focused = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=1,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+            false_destination_negative_root=false_destinations,
+            false_destination_min_error_ms=500.0,
+            false_destination_window_prob=1.0,
+        )[0]
+        replay = SWDPairDataset(
+            pairs=[pair],
+            sr=10,
+            hop_length=1,
+            max_length_sec=12.0,
+            segment_sampling="aligned_measures",
+            deterministic=True,
+            false_destination_negative_root=false_destinations,
+            false_destination_min_error_ms=500.0,
+            false_destination_window_prob=0.0,
+        )[0]
+
+        assert focused["negative_source"] == "false_destination"
+        assert focused["false_destination_source"] == "fresh_1000"
+        assert replay["window_start_event_id"] == "2"
+        assert replay["negative_valid"] is False
+
     def test_fallback_window_includes_end_boundary_anchor(self, monkeypatch, tmp_path):
         from dis_alignment.model.dataset import SWDPairDataset
 
@@ -1553,6 +1604,7 @@ class TestTrainingPairSplit:
             "  false_destination_negative_loss_weight: 0.07\n"
             "  false_destination_negative_root: results/failure_reports/mined.csv\n"
             "  false_destination_min_error_ms: 750\n"
+            "  false_destination_window_prob: 0.5\n"
             "  memory_bank_size: 128\n"
             "soft_dtw:\n"
             "  loss_weight: 0.0\n",
@@ -1607,6 +1659,7 @@ class TestTrainingPairSplit:
             false_destination_negative_loss_weight=None,
             false_destination_negative_root=None,
             false_destination_min_error_ms=None,
+            false_destination_window_prob=None,
             memory_bank_size=None,
             teacher_path_root=None,
             self_mined_path_root=None,
@@ -1639,6 +1692,7 @@ class TestTrainingPairSplit:
         assert kwargs["false_destination_negative_loss_weight"] == pytest.approx(0.07)
         assert kwargs["false_destination_negative_root"] == "results/failure_reports/mined.csv"
         assert kwargs["false_destination_min_error_ms"] == pytest.approx(750.0)
+        assert kwargs["false_destination_window_prob"] == pytest.approx(0.5)
         assert kwargs["memory_bank_size"] == 128
 
     def test_headline_claim_config_accepts_strict_audio_only_route(self):

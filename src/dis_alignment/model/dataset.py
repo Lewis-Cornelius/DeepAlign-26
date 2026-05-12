@@ -76,6 +76,7 @@ class FalseDestinationNegative:
     pred_b_s: float
     abs_error_ms: float
     error_sign: str
+    source: str | None = None
 
 
 class SWDPairDataset(Dataset):
@@ -111,6 +112,7 @@ class SWDPairDataset(Dataset):
         self_mined_path_root: str | Path | None = None,
         false_destination_negative_root: str | Path | None = None,
         false_destination_min_error_ms: float = 500.0,
+        false_destination_window_prob: float = 1.0,
         num_teacher_samples: int = 64,
         teacher_min_confidence: float = 0.0,
         relative_offset_bins: list[int] | tuple[int, ...] | None = None,
@@ -142,6 +144,7 @@ class SWDPairDataset(Dataset):
             Path(false_destination_negative_root) if false_destination_negative_root is not None else None
         )
         self.false_destination_min_error_ms = float(false_destination_min_error_ms)
+        self.false_destination_window_prob = float(np.clip(false_destination_window_prob, 0.0, 1.0))
         self.num_teacher_samples = max(0, int(num_teacher_samples))
         self.teacher_min_confidence = float(teacher_min_confidence)
         self.relative_offset_bins = tuple(sorted(int(value) for value in (relative_offset_bins or (8, 24, 64, 128))))
@@ -405,6 +408,8 @@ class SWDPairDataset(Dataset):
             sample["false_destination_gt_b_s"] = false_row.gt_b_s
             sample["false_destination_pred_b_s"] = false_row.pred_b_s
             sample["false_destination_abs_error_ms"] = false_row.abs_error_ms
+            if false_row.source is not None:
+                sample["false_destination_source"] = false_row.source
         elif spec_neg is not None:
             sample["negative_source"] = "repeated_section"
         if window is not None:
@@ -831,11 +836,20 @@ class SWDPairDataset(Dataset):
         false_destination_windows = [
             window for window in windows if self._false_destination_candidates_for_window(pair, window)
         ]
-        if false_destination_windows:
+        if false_destination_windows and self._should_focus_false_destination_window():
             windows = false_destination_windows
         if self.deterministic:
             return windows[len(windows) // 2]
         return windows[int(self._rng.integers(0, len(windows)))]
+
+    def _should_focus_false_destination_window(self) -> bool:
+        if self.false_destination_window_prob <= 0.0:
+            return False
+        if self.false_destination_window_prob >= 1.0:
+            return True
+        if self.deterministic:
+            return self.false_destination_window_prob >= 0.5
+        return bool(self._rng.random() < self.false_destination_window_prob)
 
     def _load_false_destination_negatives(self) -> dict[str, list[FalseDestinationNegative]]:
         if self.false_destination_negative_root is None:
@@ -867,6 +881,7 @@ class SWDPairDataset(Dataset):
                         pred_b_s=float(row["pred_b_s"]),
                         abs_error_ms=abs_error_ms,
                         error_sign=str(row["error_sign"]),
+                        source=str(row["source"]) if row.get("source") else None,
                     )
                 except (TypeError, ValueError):
                     continue

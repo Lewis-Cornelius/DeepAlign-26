@@ -263,6 +263,28 @@ def test_original_plan_false_destination_stage_uses_mined_negatives():
     assert evaluation["pool_size"] == 1
 
 
+def test_original_plan_false_destination_replay_stage_limits_mined_window_focus():
+    from dis_alignment.model.train import _load_training_config
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = _load_training_config(
+        repo_root / "config" / "deepalign_initial_plan_supervised_false_dest_replay_stage3.yaml"
+    )
+    training = config["training"]
+    evaluation = config["evaluation"]
+
+    assert config["dataset"]["segment_sampling"] == "aligned_measures"
+    assert config["dataset"]["samples_per_epoch"] == 256
+    assert training["resume_from"].endswith("best_model_debug_mae.pt")
+    assert training["false_destination_negative_root"].endswith("false_dest_replay_buffer_train.csv")
+    assert training["false_destination_negative_loss_weight"] == 0.05
+    assert training["false_destination_window_prob"] == 0.5
+    assert training["path_distill_loss_weight"] > 0.0
+    assert training["soft_path_distill_loss_weight"] == 0.0
+    assert evaluation["deep_decode"] == "unconstrained"
+    assert evaluation["pool_size"] == 1
+
+
 def test_strict_ablation_runner_does_not_weaken_final_gate():
     repo_root = Path(__file__).resolve().parents[1]
     runner = (repo_root / "scripts" / "run_initial_claim_strict_audio_only_sprint.ps1").read_text(encoding="utf-8")

@@ -172,6 +172,7 @@ def train(
     false_destination_negative_loss_weight: float = 0.0,
     false_destination_negative_root: str | None = None,
     false_destination_min_error_ms: float = 500.0,
+    false_destination_window_prob: float = 1.0,
     memory_bank_size: int = 0,
     teacher_path_root: str | None = None,
     self_mined_path_root: str | None = None,
@@ -301,6 +302,7 @@ def train(
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             false_destination_negative_root=false_destination_negative_root if emit_false_destination_negatives else None,
             false_destination_min_error_ms=false_destination_min_error_ms,
+            false_destination_window_prob=false_destination_window_prob,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
             relative_offset_bins=list(resolved_relative_offset_bins),
@@ -330,6 +332,7 @@ def train(
             self_mined_path_root=self_mined_path_root if segment_sampling == "self_mined_path" else None,
             false_destination_negative_root=false_destination_negative_root if emit_false_destination_negatives else None,
             false_destination_min_error_ms=false_destination_min_error_ms,
+            false_destination_window_prob=false_destination_window_prob,
             num_teacher_samples=num_anchor_samples,
             teacher_min_confidence=teacher_min_confidence,
             relative_offset_bins=list(resolved_relative_offset_bins),
@@ -510,6 +513,7 @@ def train(
             str(false_destination_negative_root) if false_destination_negative_root is not None else None
         ),
         "false_destination_min_error_ms": false_destination_min_error_ms,
+        "false_destination_window_prob": false_destination_window_prob,
         "memory_bank_size": memory_bank_size,
         "teacher_path_root": str(teacher_path_root) if teacher_path_root is not None else None,
         "self_mined_path_root": str(self_mined_path_root) if self_mined_path_root is not None else None,
@@ -1106,6 +1110,7 @@ def train(
                 "false_destination_negative_loss_weight": false_destination_negative_loss_weight,
                 "false_destination_negative_root": false_destination_negative_root,
                 "false_destination_min_error_ms": false_destination_min_error_ms,
+                "false_destination_window_prob": false_destination_window_prob,
                 "memory_bank_size": memory_bank_size,
                 "teacher_path_root": teacher_path_root,
                 "self_mined_path_root": self_mined_path_root,
@@ -1193,6 +1198,7 @@ def train(
                         "false_destination_negative_loss_weight": false_destination_negative_loss_weight,
                         "false_destination_negative_root": false_destination_negative_root,
                         "false_destination_min_error_ms": false_destination_min_error_ms,
+                        "false_destination_window_prob": false_destination_window_prob,
                         "memory_bank_size": memory_bank_size,
                         "teacher_path_root": teacher_path_root,
                         "self_mined_path_root": self_mined_path_root,
@@ -1390,6 +1396,7 @@ def _normalise_training_state_signature(signature: Any) -> dict[str, Any] | None
     normalised.setdefault("false_destination_negative_loss_weight", 0.0)
     normalised.setdefault("false_destination_negative_root", None)
     normalised.setdefault("false_destination_min_error_ms", 500.0)
+    normalised.setdefault("false_destination_window_prob", 1.0)
     normalised.setdefault("memory_bank_size", 0)
     normalised.setdefault("teacher_path_root", None)
     normalised.setdefault("self_mined_path_root", None)
@@ -1894,6 +1901,11 @@ def _build_training_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             training_cfg.get("false_destination_min_error_ms"),
             500.0,
         ),
+        "false_destination_window_prob": _resolve_option(
+            getattr(args, "false_destination_window_prob", None),
+            training_cfg.get("false_destination_window_prob"),
+            1.0,
+        ),
         "memory_bank_size": _resolve_option(
             getattr(args, "memory_bank_size", None),
             training_cfg.get("memory_bank_size"),
@@ -2037,6 +2049,7 @@ def main() -> None:
     parser.add_argument("--false-destination-negative-loss-weight", type=float, default=None)
     parser.add_argument("--false-destination-negative-root", type=str, default=None)
     parser.add_argument("--false-destination-min-error-ms", type=float, default=None)
+    parser.add_argument("--false-destination-window-prob", type=float, default=None)
     parser.add_argument("--memory-bank-size", type=int, default=None)
     parser.add_argument("--teacher-path-root", type=str, default=None)
     parser.add_argument("--self-mined-path-root", type=str, default=None)

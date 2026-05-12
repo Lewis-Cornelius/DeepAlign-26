@@ -696,6 +696,7 @@ def _row_costs(query, candidates, *, distance: str):
 @click.option("--false-destination-negative-loss-weight", type=float, default=None, help="Mined false-destination negative loss weight")
 @click.option("--false-destination-negative-root", type=click.Path(), default=None, help="CSV of mined model false destinations")
 @click.option("--false-destination-min-error-ms", type=float, default=None, help="Minimum mined false-destination error")
+@click.option("--false-destination-window-prob", type=float, default=None, help="Probability of focusing crops on mined false-destination windows")
 @click.option("--memory-bank-size", type=int, default=None, help="Reserved strict SSL memory-bank size")
 @click.option("--teacher-path-root", type=click.Path(), default=None, help="Directory containing teacher path NPZ files")
 @click.option("--self-mined-path-root", type=click.Path(), default=None, help="Directory containing model self-mined path NPZ files")
@@ -763,6 +764,7 @@ def train(
     false_destination_negative_loss_weight: float | None,
     false_destination_negative_root: str | None,
     false_destination_min_error_ms: float | None,
+    false_destination_window_prob: float | None,
     memory_bank_size: int | None,
     teacher_path_root: str | None,
     self_mined_path_root: str | None,
@@ -904,6 +906,11 @@ def train(
             false_destination_min_error_ms,
             training_cfg.get("false_destination_min_error_ms"),
             500.0,
+        ),
+        false_destination_window_prob=_coalesce(
+            false_destination_window_prob,
+            training_cfg.get("false_destination_window_prob"),
+            1.0,
         ),
         memory_bank_size=_coalesce(memory_bank_size, training_cfg.get("memory_bank_size"), 0),
         teacher_path_root=_coalesce(teacher_path_root, training_cfg.get("teacher_path_root"), None),

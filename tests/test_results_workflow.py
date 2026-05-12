@@ -37,6 +37,16 @@ def _load_false_destination_miner_script():
     return module
 
 
+def _load_false_destination_replay_script():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "build_false_destination_replay_buffer.py"
+    spec = importlib.util.spec_from_file_location("build_false_destination_replay_buffer", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_failure_report_summarizes_worst_event(tmp_path):
     module = _load_failure_report_script()
     pair = SWDPair(
@@ -149,6 +159,54 @@ def test_false_destination_miner_filters_and_suppresses_nearby_events():
 
     assert mined["event_id"].tolist() == ["a"]
     assert mined["abs_error_ms"].tolist() == [1200.0]
+
+
+def test_false_destination_replay_buffer_caps_pair_and_lied_counts():
+    module = _load_false_destination_replay_script()
+
+    def row(pair_id: str, group_id: str, event_id: str, pred_b_s: float, error_ms: float):
+        return {
+            "pair_id": pair_id,
+            "group_id": group_id,
+            "piece_b_id": f"{pair_id}_b",
+            "event_id": event_id,
+            "gt_a_s": 1.0,
+            "gt_b_s": 2.0,
+            "pred_b_s": pred_b_s,
+            "abs_error_ms": error_ms,
+            "error_sign": "late",
+            "gt_b_frame": 200,
+            "pred_b_frame": int(pred_b_s * 100),
+        }
+
+    old = pd.DataFrame(
+        [
+            row("p1", "D911-01", "old-a", 10.0, 1500.0),
+            row("p1", "D911-01", "old-b", 12.5, 1400.0),
+            row("p1", "D911-01", "old-c", 15.0, 1300.0),
+        ]
+    )
+    fresh = pd.DataFrame(
+        [
+            row("p1", "D911-01", "fresh-a", 20.0, 2200.0),
+            row("p2", "D911-01", "fresh-b", 30.0, 2100.0),
+            row("p3", "D911-02", "fresh-c", 40.0, 2000.0),
+        ]
+    )
+    old["source"] = "old"
+    fresh["source"] = "fresh"
+
+    replay = module.build_replay_buffer(
+        [("old", old), ("fresh", fresh)],
+        nms_window_sec=2.0,
+        max_per_pair=2,
+        max_per_lied=3,
+    )
+
+    assert set(replay["source"]) == {"old", "fresh"}
+    assert replay.groupby("pair_id").size().max() <= 2
+    assert replay.groupby("group_id").size().max() <= 3
+    assert "fresh-c" in replay["event_id"].tolist()
 
 
 def test_parse_methods_defaults_and_validation():
