@@ -11,9 +11,9 @@ claim:
 
 dataset:
   swd_path: null
-  max_length_sec: 8.0
+  max_length_sec: 2.0
   segment_sampling: teacher_path
-  samples_per_epoch: 2048
+  samples_per_epoch: 256
   cache_spectrograms: true
   cache_root: .cache/cqt
   debug_subset_lieder: [D911-07, D911-18, D911-20, D911-22, D911-24, D911-17, D911-06, D911-02]
@@ -35,8 +35,8 @@ model:
   temporal_attention_heads: 0
 
 training:
-  epochs: 36
-  batch_size: 3
+  epochs: 8
+  batch_size: 4
   lr: 0.00005
   weight_decay: 0.0001
   gradient_clip: 1.0
@@ -69,18 +69,18 @@ training:
   anchor_min_anchor_gap: 3
 
 soft_dtw:
-  loss_weight: 0.1
+  loss_weight: 0.02
   start_gamma: 0.1
   end_gamma: 0.01
   normalize: true
   dist_func: sqeuclidean
 
 augmentation:
-  enabled: true
+  enabled: false
   time_stretch_range: [1.0, 1.0]
   pitch_shift_range: [-1, 1]
   noise_snr_range: [25.0, 45.0]
-  augment_prob: 0.35
+  augment_prob: 0.0
 
 evaluation:
   deep_decode: unconstrained
