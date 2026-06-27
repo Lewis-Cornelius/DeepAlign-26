@@ -751,13 +751,38 @@ def estimate_chroma_shift_to_first(
     max_frames: int = 1500,
 ) -> int:
     """Estimate the chroma roll to apply to the first sequence."""
-    from synctoolbox.dtw.utils import compute_optimal_chroma_shift
+    pooled_a = _pool_feature_frames_for_shift(chroma_a, max_frames=max_frames)
+    pooled_b = _pool_feature_frames_for_shift(chroma_b, max_frames=max_frames)
+
+    try:
+        from synctoolbox.dtw.utils import compute_optimal_chroma_shift
+    except ImportError:
+        # SyncToolbox is an optional dependency. Fall back to a pure-numpy
+        # transposition estimate so chroma-shift calibration still works in
+        # environments where synctoolbox is unavailable.
+        return _estimate_chroma_shift_to_first_numpy(pooled_a, pooled_b)
 
     # SyncToolbox estimates the roll for its second argument. Swap arguments so
     # the returned value is the shift to apply to chroma_a before aligning to b.
-    pooled_a = _pool_feature_frames_for_shift(chroma_a, max_frames=max_frames)
-    pooled_b = _pool_feature_frames_for_shift(chroma_b, max_frames=max_frames)
     return int(compute_optimal_chroma_shift(pooled_b, pooled_a)) % 12
+
+
+def _estimate_chroma_shift_to_first_numpy(
+    pooled_a: NDArray[np.floating],
+    pooled_b: NDArray[np.floating],
+) -> int:
+    """Estimate the chroma roll for the first sequence without synctoolbox.
+
+    Aggregates each sequence into a time-averaged 12-bin chroma energy profile
+    and picks the cyclic semitone shift (0-11) of the first profile that best
+    correlates with the second. This matches the synctoolbox convention of
+    returning the roll to apply to the first sequence before aligning to the
+    second, and is order-invariant so the two sequences may differ in length.
+    """
+    profile_a = np.asarray(pooled_a, dtype=np.float64).mean(axis=1)
+    profile_b = np.asarray(pooled_b, dtype=np.float64).mean(axis=1)
+    scores = [float(np.dot(profile_b, np.roll(profile_a, shift))) for shift in range(12)]
+    return int(np.argmax(scores)) % 12
 
 
 def apply_chroma_shift_to_blocks(
